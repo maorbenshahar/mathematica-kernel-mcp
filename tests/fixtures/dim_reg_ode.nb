@@ -1,0 +1,9 @@
+Notebook[{
+Cell["Dimensional Regularization ODE", "Title"],
+Cell["The general solve stays unevaluated, but special dimensions can be checked exactly.", "Text"],
+Cell["ClearAll /@ {v, r, e, l, w, eqn, generalSolution, solutionEHalf, verificationEHalf}", "Input"],
+Cell["eqn = v'' @ r + (w^2 - l^2 w^2/r^(1 - 2 e) - (l - e) (l - e + 1)/r^2) (v @ r) == 0", "Input"],
+Cell["generalSolution = {eqn, v, r} // Apply @ DSolveValue", "Input"],
+Cell["solutionEHalf = {eqn /. e -> 1/2, v, r} // Apply @ DSolveValue", "Input"],
+Cell["verificationEHalf = eqn /. e -> 1/2 /. v -> solutionEHalf // FullSimplify", "Input"]
+}]

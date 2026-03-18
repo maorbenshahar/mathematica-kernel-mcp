@@ -1,0 +1,298 @@
+"""Session manager for persistent Wolfram Language kernel sessions."""
+
+import logging
+import threading
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+
+from wolframclient.evaluation import WolframLanguageSession
+from wolframclient.language import wlexpr
+
+from mathematica_kernel_mcp.models import CellRuntimeInfo, EvalResult, SessionInfo
+
+logger = logging.getLogger(__name__)
+
+# Default max characters for output summary
+DEFAULT_SUMMARY_MAX = 500
+# Default timeout for evaluations (seconds)
+DEFAULT_TIMEOUT = 30
+# Kernel startup can be slow, especially on first launch
+KERNEL_STARTUP_TIMEOUT = 60
+
+
+@dataclass
+class ManagedSession:
+    """A kernel session with metadata."""
+
+    name: str
+    session: WolframLanguageSession
+    is_busy: bool = False
+    out_count: int = 0
+    cell_runs: dict[tuple[str, str], CellRuntimeInfo] = field(default_factory=dict)
+
+
+class SessionManager:
+    """Manages named Wolfram Language kernel sessions."""
+
+    def __init__(self, kernel_path: str | None = None, startup_timeout: int = KERNEL_STARTUP_TIMEOUT):
+        """Initialize the session manager.
+
+        Args:
+            kernel_path: Path to WolframKernel binary. If None, wolframclient
+                        will attempt to find it automatically.
+            startup_timeout: Seconds to wait for kernel startup.
+        """
+        self._kernel_path = kernel_path
+        self._startup_timeout = startup_timeout
+        self._sessions: dict[str, ManagedSession] = {}
+        self._lock = threading.Lock()
+
+    def _create_kernel_session(self) -> WolframLanguageSession:
+        """Create a new WolframLanguageSession."""
+        if self._kernel_path:
+            session = WolframLanguageSession(self._kernel_path)
+        else:
+            session = WolframLanguageSession()
+        session.set_parameter("STARTUP_TIMEOUT", self._startup_timeout)
+        return session
+
+    def _cell_run_key(self, file_path: str, cell_id: str) -> tuple[str, str]:
+        return (str(Path(file_path).resolve()), cell_id)
+
+    def start(self) -> None:
+        """Start the session manager and create the main session."""
+        self.create_session("main")
+
+    def stop(self) -> None:
+        """Stop all sessions."""
+        with self._lock:
+            for managed in self._sessions.values():
+                try:
+                    managed.session.stop()
+                except Exception:
+                    logger.warning("Failed to stop session %s", managed.name)
+            self._sessions.clear()
+
+    def create_session(self, name: str) -> str:
+        """Create a new named kernel session.
+
+        Returns the session name.
+        """
+        with self._lock:
+            if name in self._sessions:
+                raise ValueError(f"Session '{name}' already exists")
+            session = self._create_kernel_session()
+            session.start()
+            self._sessions[name] = ManagedSession(name=name, session=session)
+            logger.info("Created session '%s'", name)
+            return name
+
+    def close_session(self, name: str) -> None:
+        """Close and remove a named session."""
+        if name == "main":
+            raise ValueError("Cannot close the main session. Use kernel_restart instead.")
+        with self._lock:
+            managed = self._sessions.pop(name, None)
+            if managed is None:
+                raise ValueError(f"Session '{name}' does not exist")
+            managed.session.stop()
+            logger.info("Closed session '%s'", name)
+
+    def get_session(self, name: str = "main") -> ManagedSession:
+        """Get a managed session by name."""
+        with self._lock:
+            managed = self._sessions.get(name)
+            if managed is None:
+                raise ValueError(f"Session '{name}' does not exist")
+            return managed
+
+    def list_sessions(self) -> list[SessionInfo]:
+        """List all sessions with their status."""
+        with self._lock:
+            result = []
+            for managed in self._sessions.values():
+                alive = False
+                try:
+                    alive = managed.session.started
+                except Exception:
+                    pass
+                result.append(
+                    SessionInfo(
+                        name=managed.name,
+                        is_alive=alive,
+                        is_busy=managed.is_busy,
+                        out_count=managed.out_count,
+                    )
+                )
+            return result
+
+    def evaluate(
+        self,
+        code: str,
+        session_name: str = "main",
+        timeout: int = DEFAULT_TIMEOUT,
+        summary_max: int = DEFAULT_SUMMARY_MAX,
+    ) -> EvalResult:
+        """Evaluate code in a named session, return a summarized result.
+
+        Uses TimeConstrained inside the kernel (not wolframclient timeout)
+        to avoid killing the kernel on timeout.
+        """
+        managed = self.get_session(session_name)
+        managed.is_busy = True
+        try:
+            managed.out_count += 1
+            in_number = managed.out_count
+            out_number = managed.out_count
+
+            # Evaluate and store result in one expression.
+            # Uses TimeConstrained for safe timeout (doesn't kill kernel).
+            # Stores result in wolfram$mcp$out[n] for later retrieval.
+            store_code = (
+                f"wolfram$mcp$out[{out_number}] = "
+                f"TimeConstrained[({code}), {timeout}]"
+            )
+
+            # evaluate_wrap gives us messages separately
+            raw = managed.session.evaluate_wrap(wlexpr(store_code))
+
+            # Extract messages
+            messages = []
+            if hasattr(raw, "messages") and raw.messages:
+                for msg in raw.messages:
+                    if isinstance(msg, tuple) and len(msg) >= 2:
+                        messages.append(str(msg[1]))
+                    else:
+                        messages.append(str(msg))
+
+            # Check for timeout
+            result = raw.result if hasattr(raw, "result") else raw
+            result_str = str(result)
+            if result_str == "$Aborted":
+                return EvalResult(
+                    output_summary="$Aborted (timed out)",
+                    head="$Aborted",
+                    byte_size=0,
+                    leaf_count=0,
+                    messages=messages,
+                    is_truncated=False,
+                    in_number=in_number,
+                    out_number=out_number,
+                )
+
+            # Get metadata about the result from the kernel
+            meta_code = f"""
+            With[{{res = wolfram$mcp$out[{out_number}]}},
+                {{
+                    If[
+                        AtomQ[res],
+                        ToString[res, InputForm],
+                        ToString[Shallow[res, {{5, 3}}], OutputForm]
+                    ],
+                    ToString[Head[res]],
+                    ByteCount[res],
+                    LeafCount[res]
+                }}
+            ]
+            """
+            meta = managed.session.evaluate(wlexpr(meta_code))
+
+            summary = str(meta[0]) if meta else result_str
+            head = str(meta[1]) if meta else "Unknown"
+            byte_size = int(meta[2]) if meta else 0
+            leaf_count = int(meta[3]) if meta else 0
+
+            # Truncate summary if needed
+            is_truncated = len(summary) > summary_max
+            if is_truncated:
+                summary = summary[:summary_max] + "..."
+
+            return EvalResult(
+                output_summary=summary,
+                head=head,
+                byte_size=byte_size,
+                leaf_count=leaf_count,
+                messages=messages,
+                is_truncated=is_truncated,
+                in_number=in_number,
+                out_number=out_number,
+            )
+        finally:
+            managed.is_busy = False
+
+    def evaluate_raw(
+        self,
+        code: str,
+        session_name: str = "main",
+    ) -> str:
+        """Evaluate code and return raw string result. For internal/inspection use."""
+        managed = self.get_session(session_name)
+        result = managed.session.evaluate(wlexpr(code))
+        return str(result)
+
+    def restart_session(self, name: str = "main") -> None:
+        """Restart a kernel session (fresh state)."""
+        managed = self.get_session(name)
+        managed.session.stop()
+        managed.session.start()
+        managed.out_count = 0
+        managed.cell_runs.clear()
+        logger.info("Restarted session '%s'", name)
+
+    def record_cell_run(
+        self,
+        file_path: str,
+        cell_id: str,
+        result: EvalResult,
+        session_name: str = "main",
+    ) -> CellRuntimeInfo:
+        """Persist per-session runtime metadata for a file/cell pair."""
+        managed = self.get_session(session_name)
+        runtime = CellRuntimeInfo(
+            last_in=result.in_number,
+            last_out=result.out_number,
+            messages=list(result.messages),
+            last_run_at=datetime.now(timezone.utc).isoformat(),
+        )
+        managed.cell_runs[self._cell_run_key(file_path, cell_id)] = runtime
+        return runtime
+
+    def get_cell_run_info(
+        self,
+        file_path: str,
+        cell_id: str,
+        session_name: str = "main",
+    ) -> CellRuntimeInfo:
+        """Return the last recorded run metadata for a file/cell pair."""
+        managed = self.get_session(session_name)
+        runtime = managed.cell_runs.get(self._cell_run_key(file_path, cell_id))
+        if runtime is None:
+            return CellRuntimeInfo()
+        return CellRuntimeInfo(
+            last_in=runtime.last_in,
+            last_out=runtime.last_out,
+            messages=list(runtime.messages),
+            last_run_at=runtime.last_run_at,
+        )
+
+    def clear_cell_run_info(
+        self,
+        file_path: str,
+        cell_id: str,
+        session_name: str | None = None,
+    ) -> None:
+        """Clear persisted run metadata for a file/cell pair.
+
+        When `session_name` is omitted, the metadata is cleared in every session
+        because the source content has changed globally.
+        """
+        key = self._cell_run_key(file_path, cell_id)
+        if session_name is not None:
+            managed = self.get_session(session_name)
+            managed.cell_runs.pop(key, None)
+            return
+
+        with self._lock:
+            for managed in self._sessions.values():
+                managed.cell_runs.pop(key, None)
