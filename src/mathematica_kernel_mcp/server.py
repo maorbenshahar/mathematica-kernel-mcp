@@ -84,9 +84,9 @@ mcp = FastMCP(
 ## Two modes (auto-detected per file)
 - **Collaborative**: a `.shared_kernel_bridge/` directory next to the target file
   indicates the user has Mathematica open with the file and has evaluated
-  `StartSharedKernelBridge[...]` from `shared_kernel_bridge.wl`. You drive a
-  kernel they share with you, edits land live in their open notebook, and they
-  see your activity in real time.
+  `<< SharedKernelMCP`` + `StartSharedKernelBridge[]`. You drive a kernel they
+  share with you, edits land live in their open notebook, and they see your
+  activity in real time.
 - **Solo**: no bridge. Files are mutated on disk; code runs in a kernel the
   MCP spawns via `wolframclient`. Requires a locatable WolframKernel binary.
 

@@ -1,4 +1,4 @@
-BeginPackage["CorrelatorNotebookBridge`"];
+BeginPackage["SharedKernelMCP`"];
 
 StartSharedKernelBridge::usage =
   "StartSharedKernelBridge[] starts a queue-driven bridge inside the current notebook kernel. \
@@ -81,14 +81,22 @@ ensureDirectory[path_String] := Module[{},
   path
 ];
 
-defaultRootDirectory[nb_] := Module[{base},
+defaultRootDirectory[nb_] := Module[{base, name},
   base = Quiet @ Check[
     If[MatchQ[nb, _NotebookObject], NotebookDirectory[nb], $Failed],
     $Failed
   ];
+  name = Quiet @ Check[
+    If[MatchQ[nb, _NotebookObject],
+      FileNameTake[NotebookFileName[nb], -1],
+      "untitled"
+    ],
+    "untitled"
+  ];
+  If[!StringQ[name], name = "untitled"];
   If[StringQ[base],
-    FileNameJoin[{base, ".shared_kernel_bridge"}],
-    FileNameJoin[{Directory[], ".shared_kernel_bridge"}]
+    FileNameJoin[{base, ".shared_kernel_bridge", name}],
+    FileNameJoin[{Directory[], ".shared_kernel_bridge", name}]
   ]
 ];
 
@@ -234,7 +242,7 @@ processCommandFile[file_String, state_Association] := Module[
     Return[$Failed]
   ];
 
-  code = Quiet @ Check[Import[processingFile, "Text"], $Failed];
+  code = Quiet @ Check[Import[processingFile, "Text", CharacterEncoding -> "UTF8"], $Failed];
   If[! StringQ[code],
     status = "read_error";
     Export[resultFile, bridgeResultAssociation[queueId, "", status, $Failed, {}, {}, 0.], "JSON"];
@@ -257,7 +265,9 @@ processCommandFile[file_String, state_Association] := Module[
   If[held === $Failed,
     status = "parse_error";
     messages = parseMessages;
-    appendTextCell[nb, "Bridge parse error in queued command " <> queueId <> ".", "Message"];
+    If[!silent,
+      appendTextCell[nb, "Bridge parse error in queued command " <> queueId <> ".", "Message"]
+    ];
     Export[resultFile, bridgeResultAssociation[queueId, code, status, $Failed, messages, prints, 0.], "JSON"];
     Export[logFile, StringRiffle[messages, "\n"], "Text"];
     RenameFile[processingFile, doneFile, OverwriteTarget -> True];
@@ -499,7 +509,8 @@ BridgeRunCell[path_String, cellID_Integer] := Module[
     outputTag,
     outputCell,
     existingOutput,
-    printFunction
+    printFunction,
+    lineNum
   },
 
   nb = findNotebookByPath[path];
@@ -538,6 +549,8 @@ BridgeRunCell[path_String, cellID_Integer] := Module[
   );
 
   started = AbsoluteTime[];
+  $Line++;
+  lineNum = $Line;
   result = CheckAbort[
     Block[
       {
@@ -555,6 +568,21 @@ BridgeRunCell[path_String, cellID_Integer] := Module[
   ];
   duration = AbsoluteTime[] - started;
 
+  (* Persist Out[lineNum] so the kernel's history mirrors a main-loop eval, *)
+  (* and label both input + output cells so the front end shows In[N]:= / Out[N]= *)
+  Quiet @ Check[Out[lineNum] = result, Null];
+  (* CellLabelAutoDelete -> False keeps the label text from being cleared. *)
+  (* CellLabelStyle -> "CellLabel" (without "CellLabelExpired") keeps the  *)
+  (* label rendered as a fresh / just-evaluated label, not a stale one.    *)
+  Quiet @ Check[
+    SetOptions[target,
+      CellLabel -> "In[" <> ToString[lineNum] <> "]:= ",
+      CellLabelAutoDelete -> False,
+      CellLabelStyle -> "CellLabel"
+    ],
+    Null
+  ];
+
   outputTag = bridgeOutputTagFor[cellID];
   existingOutput = findExistingOutputCell[nb, outputTag];
 
@@ -563,6 +591,9 @@ BridgeRunCell[path_String, cellID_Integer] := Module[
     outputCell = Cell[
       BoxData @ ToBoxes[result, StandardForm],
       "Output",
+      CellLabel -> "Out[" <> ToString[lineNum] <> "]= ",
+      CellLabelAutoDelete -> False,
+      CellLabelStyle -> "CellLabel",
       CellTags -> {outputTag}
     ];
     If[existingOutput =!= Null,

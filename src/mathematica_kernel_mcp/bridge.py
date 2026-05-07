@@ -40,8 +40,14 @@ class SharedKernelBridge:
 
     @classmethod
     def for_file(cls, file_path: str | Path, timeout: float = DEFAULT_TIMEOUT) -> "SharedKernelBridge":
-        """Locate the bridge by looking next to the given file."""
-        bridge_root = Path(file_path).resolve().parent / cls.DEFAULT_DIR
+        """Locate the bridge by looking next to the given file.
+
+        Each notebook gets its own bridge subtree at
+        ``<file_dir>/.shared_kernel_bridge/<filename>/`` so multiple files in
+        one directory can run independent bridges without sharing a queue.
+        """
+        p = Path(file_path).resolve()
+        bridge_root = p.parent / cls.DEFAULT_DIR / p.name
         return cls(bridge_root, timeout=timeout)
 
     def call(self, code: str, *, silent: bool = True) -> dict:
@@ -51,7 +57,7 @@ class SharedKernelBridge:
         results_file = self.results_dir / f"{cmd_id}.json"
 
         prefix = "(*SILENT*)\n" if silent else ""
-        queue_file.write_text(prefix + code)
+        queue_file.write_text(prefix + code, encoding="utf-8")
 
         deadline = time.time() + self.timeout
         while time.time() < deadline:

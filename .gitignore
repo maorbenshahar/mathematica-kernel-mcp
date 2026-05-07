@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+build/
+dist/
+
+# Editor / OS
+.DS_Store
+
+# Shared kernel bridge runtime data (created by StartSharedKernelBridge)
+.shared_kernel_bridge/

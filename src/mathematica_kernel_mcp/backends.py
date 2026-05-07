@@ -325,7 +325,8 @@ class SoloBackend(Backend):
 
 
 def has_bridge_for(path: str) -> bool:
-    bridge_root = Path(path).resolve().parent / ".shared_kernel_bridge"
+    p = Path(path).resolve()
+    bridge_root = p.parent / ".shared_kernel_bridge" / p.name
     return (bridge_root / "queue").exists() and (bridge_root / "results").exists()
 
 
