@@ -12,3 +12,6 @@ dist/
 
 # Shared kernel bridge runtime data (created by StartSharedKernelBridge)
 .shared_kernel_bridge/
+
+# Paclet archives produced by CreatePacletArchive
+*.paclet
