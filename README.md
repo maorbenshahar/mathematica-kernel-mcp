@@ -39,7 +39,7 @@ Then in the notebook of the file you want to work on:
 StartSharedKernelBridge[]
 ```
 
-Open your LLM client and ask it to read or edit the file. The 18
+Open your LLM client and ask it to read or edit the file. The 19
 `notebook_*` tools are available.
 
 ## Tools
@@ -49,8 +49,9 @@ Open your LLM client and ask it to read or edit the file. The 18
   `notebook_insert_cell_after`/`_before`, `notebook_delete_cell`,
   `notebook_eval`, `notebook_eval_inline`, `notebook_sweep_outputs`.
 - **State + introspection**: `notebook_kernel_state`, `notebook_kernel_restart`,
-  `notebook_symbol_info`, `notebook_documentation_search`, `notebook_names`,
-  `notebook_list_symbols`, `notebook_get_output`.
+  `notebook_abort_evaluation`, `notebook_symbol_info`,
+  `notebook_documentation_search`, `notebook_names`, `notebook_list_symbols`,
+  `notebook_get_output`.
 
 `cell_id` is opaque — pass back what you got from `notebook_read` /
 `notebook_search`. In collab it's a Mathematica `CellID` (stable); in solo
@@ -59,6 +60,35 @@ it's a 1-indexed position (re-read after mutations).
 `StartSharedKernelBridge[]` defaults to a `.shared_kernel_bridge/` directory in
 `NotebookDirectory[]` and a 1s poll. Override with options if you really need
 to.
+
+## Bounding evaluation time
+
+The run-style tools accept an optional `eval_timeout` (seconds). When set, the
+kernel wraps the eval in `TimeConstrained[..., eval_timeout]`; an evaluation
+that exceeds it returns `status="timeout"` instead of hanging the kernel.
+**This is the recommended autonomous mechanism** — fully cross-platform,
+headless, no signals involved.
+
+```text
+notebook_run_cell(path, cell_id, eval_timeout=10)   # abort the cell after 10s
+notebook_eval(path, "Simplify[hugeExpr]", eval_timeout=30)
+```
+
+If an evaluation has already escaped `eval_timeout` (rare, but possible with
+pathological C-level routines that don't poll), `notebook_abort_evaluation(path)`
+is a *best-effort* fallback that sends SIGINT to the kernel PID. Behavior
+depends on mode + OS:
+
+- **Solo mode on POSIX (Linux/macOS)** — silent, headless. The kernel calls
+  `Abort[]` at its next polling point.
+- **Solo mode on Windows** — POSIX signal semantics differ; not reliable. Use
+  `eval_timeout` instead.
+- **Collab mode (any OS)** — the GUI front-end intercepts SIGINT and prompts
+  the user via an interactive dialog. Treat this tool as "tap on the user's
+  shoulder," not a fully autonomous abort.
+
+`clear_queue=True` additionally drops any pending queued commands so the abort
+isn't immediately followed by another runaway (collab only).
 
 
 ## Troubleshooting

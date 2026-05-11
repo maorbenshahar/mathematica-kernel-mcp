@@ -22,7 +22,8 @@ BridgeRunCell::usage =
   "BridgeRunCell[path, cellID] evaluates the cell with the given integer CellID in the notebook \
 open at `path`, and writes an Output cell directly beneath that input (replacing any prior output \
 written by the bridge for the same cell). Returns an association with status, messages, prints, \
-duration, and the result in InputForm.";
+duration, and the result in InputForm. BridgeRunCell[path, cellID, evalTimeout] wraps the cell \
+evaluation in TimeConstrained[..., evalTimeout]; on time-out, status is \"timeout\".";
 
 BridgeUpdateCell::usage =
   "BridgeUpdateCell[path, cellID, cellType, content] replaces the cell with the given integer \
@@ -108,6 +109,18 @@ initializeDirectories[root_String] := <|
   "Results" -> ensureDirectory[FileNameJoin[{root, "results"}]],
   "Logs" -> ensureDirectory[FileNameJoin[{root, "logs"}]]
 |>;
+
+kernelPIDFile[root_String] := FileNameJoin[{root, "kernel.pid"}];
+
+writeKernelPIDFile[root_String] := Module[{file = kernelPIDFile[root]},
+  Quiet @ Check[Export[file, ToString[$ProcessID], "Text"], $Failed];
+  file
+];
+
+removeKernelPIDFile[root_String] := Module[{file = kernelPIDFile[root]},
+  If[FileExistsQ[file], Quiet @ Check[DeleteFile[file], Null]];
+  Null
+];
 
 stringify[expr_] := ToString[Unevaluated[expr], InputForm, PageWidth -> Infinity];
 
@@ -227,7 +240,9 @@ processCommandFile[file_String, state_Association] := Module[
     nb = state["Notebook"],
     started,
     printFunction,
-    silent = False
+    silent = False,
+    evalTimeout = Null,
+    timeoutTag
   },
 
   queueName = FileNameTake[file];
@@ -251,6 +266,17 @@ processCommandFile[file_String, state_Association] := Module[
   ];
 
   silent = StringStartsQ[code, "(*SILENT*)"];
+  evalTimeout = Replace[
+    First[
+      StringCases[
+        code,
+        "(*TIMEOUT:" ~~ n:NumberString ~~ "*)" :> ToExpression[n],
+        1
+      ],
+      Null
+    ],
+    x_ /; ! (NumericQ[x] && x > 0) -> Null
+  ];
 
   Block[
     {
@@ -295,7 +321,11 @@ processCommandFile[file_String, state_Association] := Module[
         $MessageList = {},
         Print = printFunction
       },
-      With[{evaluated = ReleaseHold[held]},
+      With[{evaluated = If[
+          NumericQ[evalTimeout],
+          TimeConstrained[ReleaseHold[held], evalTimeout, timeoutTag],
+          ReleaseHold[held]
+        ]},
         messages = stringify /@ $MessageList;
         evaluated
       ]
@@ -304,6 +334,10 @@ processCommandFile[file_String, state_Association] := Module[
     $Aborted
   ];
   duration = AbsoluteTime[] - started;
+  If[result === timeoutTag,
+    status = "timeout";
+    result = $Aborted
+  ];
 
   If[!silent && status === "ok" && messages =!= {},
     appendTextCell[nb, StringRiffle[messages, "\n"], "Message"]
@@ -493,7 +527,7 @@ BridgeReadNotebook[path_String] := Module[{nb, mapping},
   |>
 ];
 
-BridgeRunCell[path_String, cellID_Integer] := Module[
+BridgeRunCell[path_String, cellID_Integer, evalTimeout_:Null] := Module[
   {
     nb,
     target,
@@ -510,8 +544,11 @@ BridgeRunCell[path_String, cellID_Integer] := Module[
     outputCell,
     existingOutput,
     printFunction,
-    lineNum
+    lineNum,
+    timeoutTag,
+    effectiveTimeout
   },
+  effectiveTimeout = If[NumericQ[evalTimeout] && evalTimeout > 0, evalTimeout, Null];
 
   nb = findNotebookByPath[path];
   If[! MatchQ[nb, _NotebookObject],
@@ -559,7 +596,11 @@ BridgeRunCell[path_String, cellID_Integer] := Module[
         $MessageList = {},
         Print = printFunction
       },
-      With[{evaluated = ReleaseHold[parseHeld]},
+      With[{evaluated = If[
+          NumericQ[effectiveTimeout],
+          TimeConstrained[ReleaseHold[parseHeld], effectiveTimeout, timeoutTag],
+          ReleaseHold[parseHeld]
+        ]},
         messages = stringify /@ $MessageList;
         evaluated
       ]
@@ -567,6 +608,10 @@ BridgeRunCell[path_String, cellID_Integer] := Module[
     status = "aborted"; $Aborted
   ];
   duration = AbsoluteTime[] - started;
+  If[result === timeoutTag,
+    status = "timeout";
+    result = $Aborted
+  ];
 
   (* Persist Out[lineNum] so the kernel's history mirrors a main-loop eval, *)
   (* and label both input + output cells so the front end shows In[N]:= / Out[N]= *)
@@ -744,9 +789,14 @@ ProcessSharedKernelBridgeQueue[] := Module[{state, files},
   Length[files]
 ];
 
-StopSharedKernelBridge[] := Module[{task = Lookup[$BridgeState, "Task", Missing["NoTask"]]},
+StopSharedKernelBridge[] := Module[
+  {task = Lookup[$BridgeState, "Task", Missing["NoTask"]],
+   dirs = Lookup[$BridgeState, "Directories", <||>]},
   If[MatchQ[task, _ScheduledTaskObject],
     Quiet @ Check[RemoveScheduledTask[task], Null]
+  ];
+  If[AssociationQ[dirs] && KeyExistsQ[dirs, "Root"],
+    removeKernelPIDFile[dirs["Root"]]
   ];
   $BridgeState = <||>;
   Null
@@ -771,8 +821,11 @@ StartSharedKernelBridge[OptionsPattern[]] := Module[
     "EchoInput" -> TrueQ[OptionValue["EchoInput"]],
     "EchoOutput" -> TrueQ[OptionValue["EchoOutput"]],
     "EchoPrint" -> TrueQ[OptionValue["EchoPrint"]],
-    "SnapshotPath" -> snapshotPath
+    "SnapshotPath" -> snapshotPath,
+    "KernelPID" -> $ProcessID
   |>;
+
+  writeKernelPIDFile[dirs["Root"]];
 
   task = RunScheduledTask[ProcessSharedKernelBridgeQueue[], OptionValue["PollInterval"]];
   $BridgeState["Task"] = task;
@@ -788,7 +841,8 @@ SharedKernelBridgeStatus[] := <|
   "QueueDirectory" -> Lookup[Lookup[$BridgeState, "Directories", <||>], "Queue", Missing["NoQueue"]],
   "ResultsDirectory" -> Lookup[Lookup[$BridgeState, "Directories", <||>], "Results", Missing["NoResults"]],
   "SnapshotPath" -> Lookup[$BridgeState, "SnapshotPath", Missing["NoSnapshot"]],
-  "PollInterval" -> Lookup[$BridgeState, "PollInterval", Missing["NoInterval"]]
+  "PollInterval" -> Lookup[$BridgeState, "PollInterval", Missing["NoInterval"]],
+  "KernelPID" -> Lookup[$BridgeState, "KernelPID", $ProcessID]
 |>;
 
 End[];

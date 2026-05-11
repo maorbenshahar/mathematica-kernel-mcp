@@ -1,6 +1,8 @@
 """Session manager for persistent Wolfram Language kernel sessions."""
 
 import logging
+import os
+import signal as _signal
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -30,6 +32,13 @@ class ManagedSession:
     is_busy: bool = False
     out_count: int = 0
     cell_runs: dict[tuple[str, str], CellRuntimeInfo] = field(default_factory=dict)
+    pid: int | None = None
+
+
+_ABORT_SIGNALS = {
+    "SIGINT": _signal.SIGINT,
+    "SIGTERM": _signal.SIGTERM,
+}
 
 
 class SessionManager:
@@ -84,8 +93,14 @@ class SessionManager:
                 raise ValueError(f"Session '{name}' already exists")
             session = self._create_kernel_session()
             session.start()
-            self._sessions[name] = ManagedSession(name=name, session=session)
-            logger.info("Created session '%s'", name)
+            pid: int | None
+            try:
+                pid = int(session.evaluate(wlexpr("$ProcessID")))
+            except Exception:
+                pid = None
+                logger.warning("Could not capture $ProcessID for session %s", name)
+            self._sessions[name] = ManagedSession(name=name, session=session, pid=pid)
+            logger.info("Created session '%s' (pid=%s)", name, pid)
             return name
 
     def close_session(self, name: str) -> None:
@@ -238,7 +253,29 @@ class SessionManager:
         managed.session.start()
         managed.out_count = 0
         managed.cell_runs.clear()
-        logger.info("Restarted session '%s'", name)
+        try:
+            managed.pid = int(managed.session.evaluate(wlexpr("$ProcessID")))
+        except Exception:
+            managed.pid = None
+        logger.info("Restarted session '%s' (pid=%s)", name, managed.pid)
+
+    def abort_session(self, name: str = "main", signal: str = "SIGINT") -> int:
+        """Signal the kernel process to abort its current evaluation.
+
+        Returns the PID that was signaled.
+        """
+        sig_num = _ABORT_SIGNALS.get(signal.upper())
+        if sig_num is None:
+            raise ValueError(
+                f"Unsupported abort signal {signal!r}; use one of {sorted(_ABORT_SIGNALS)}."
+            )
+        managed = self.get_session(name)
+        if managed.pid is None:
+            raise RuntimeError(
+                f"Session '{name}' has no captured PID; cannot signal kernel."
+            )
+        os.kill(managed.pid, sig_num)
+        return managed.pid
 
     def record_cell_run(
         self,

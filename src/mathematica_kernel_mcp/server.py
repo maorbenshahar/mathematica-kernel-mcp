@@ -111,6 +111,10 @@ bridge is present next to the file you pass in.
 ## Kernel state + introspection
 - `notebook_kernel_state(path, fields=...)` — memory, version, context, packages.
 - `notebook_kernel_restart(path)` — solo only; refused in collab.
+- `notebook_abort_evaluation(path, signal="SIGINT", clear_queue=False)` —
+  best-effort kernel abort when an eval is already in flight. Silent and
+  headless only in solo mode on POSIX; in collab mode the GUI front-end
+  surfaces a dialog the user must dismiss. Prefer `eval_timeout`.
 - `notebook_symbol_info(path, name, fields=...)` — usage, definition, attributes,
   options, context, *Values, messages.
 - `notebook_documentation_search(path, query)` — ranked WL doc matches.
@@ -118,6 +122,17 @@ bridge is present next to the file you pass in.
 - `notebook_list_symbols(path, context="Global`")` — symbols by context.
 - `notebook_get_output(path, out_number, view="full"|"short"|"summary")` —
   inspect a previous `Out[n]` (full / shallow / metadata).
+
+## Bounding evaluation time
+The run-style tools (`notebook_run_cell`, `notebook_run_cells`, `notebook_eval`,
+`notebook_eval_inline`) accept `eval_timeout` (seconds). When set, the
+kernel wraps the eval in `TimeConstrained[..., eval_timeout]`; exceeding it
+returns status="timeout" instead of hanging the kernel. **This is the
+recommended autonomous mechanism** — cross-platform, headless, no signals.
+Use it whenever a computation might run away (`Simplify`, `Solve` on large
+systems, etc.). `notebook_abort_evaluation` exists as a fallback but its
+behavior depends on mode + OS (see that tool's docstring) — in collab mode
+it surfaces a dialog the user must dismiss.
 
 `cell_id` is opaque — pass back what you got from `notebook_read` / `notebook_search`.
 In collab it's a Mathematica `CellID` (integer, stable across reorders); in solo
@@ -255,14 +270,28 @@ def notebook_search(
 
 
 @mcp.tool()
-def notebook_run_cell(path: str, cell_id: int, timeout: float = 60.0) -> dict:
+def notebook_run_cell(
+    path: str,
+    cell_id: int,
+    timeout: float = 60.0,
+    eval_timeout: float | None = None,
+) -> dict:
     """Evaluate the cell with the given cellID.
 
     In collab mode, the Output appears under the input cell in the live notebook
     (replacing any prior bridge-tagged output for the same cell). In solo mode,
     the result is returned but no notebook is updated.
+
+    `timeout` bounds how long Python waits for the result file (bridge-side).
+    `eval_timeout` (seconds) is enforced kernel-side via TimeConstrained: when
+    set, an evaluation exceeding it is aborted and returned with status="timeout".
+    Use `eval_timeout` proactively when you don't trust a computation to finish.
     """
-    return _backend_call(path, lambda b: b.run_cell(path, cell_id), timeout=timeout)
+    return _backend_call(
+        path,
+        lambda b: b.run_cell(path, cell_id, eval_timeout=eval_timeout),
+        timeout=timeout,
+    )
 
 
 @mcp.tool()
@@ -326,14 +355,26 @@ def notebook_sweep_outputs(path: str, timeout: float = 30.0) -> dict:
 
 
 @mcp.tool()
-def notebook_eval(path: str, code: str, timeout: float = 60.0) -> dict:
+def notebook_eval(
+    path: str,
+    code: str,
+    timeout: float = 60.0,
+    eval_timeout: float | None = None,
+) -> dict:
     """Evaluate WL code SILENTLY (no notebook trace).
 
     Use for LLM-internal probes. The result envelope has status, resultInputForm,
     messages, etc. Use `notebook_eval_inline` instead when the user should see
     the input + output.
+
+    `eval_timeout` (seconds) wraps the eval in TimeConstrained kernel-side; on
+    expiry, status="timeout".
     """
-    return _backend_call(path, lambda b: b.evaluate(path, code), timeout=timeout)
+    return _backend_call(
+        path,
+        lambda b: b.evaluate(path, code, eval_timeout=eval_timeout),
+        timeout=timeout,
+    )
 
 
 @mcp.tool()
@@ -343,16 +384,22 @@ def notebook_eval_inline(
     code: str,
     cell_type: str = "Code",
     timeout: float = 60.0,
+    eval_timeout: float | None = None,
 ) -> dict:
     """Insert a Code cell after `anchor_cell_id`, evaluate it, return the result.
 
     Single-call "let me try this" gesture. In collab mode, the Input + Output
     appear in the live notebook so the user sees what you tried. The cell stays
     in the file/notebook — `notebook_delete_cell` it later if you want to clean up.
+
+    `eval_timeout` (seconds) wraps the eval in TimeConstrained kernel-side; on
+    expiry, status="timeout".
     """
     return _backend_call(
         path,
-        lambda b: b.eval_inline(path, anchor_cell_id, code, cell_type),
+        lambda b: b.eval_inline(
+            path, anchor_cell_id, code, cell_type, eval_timeout=eval_timeout
+        ),
         timeout=timeout,
     )
 
@@ -515,6 +562,7 @@ def notebook_run_cells(
     all: bool = False,
     stop_on_error: bool = True,
     timeout: float = 60.0,
+    eval_timeout: float | None = None,
 ) -> dict:
     """Run multiple cells in order in a single MCP call.
 
@@ -526,6 +574,8 @@ def notebook_run_cells(
     Returns a list of per-cell result dicts. With `stop_on_error=True` (default),
     halts on the first failure. Faster than looping `notebook_run_cell` because
     selection happens in one read instead of per call.
+
+    `eval_timeout` (seconds) applies to each cell individually via TimeConstrained.
     """
     def _do(backend):
         all_cells = backend.read(path).get("cells", [])
@@ -556,7 +606,7 @@ def notebook_run_cells(
         results: list[dict] = []
         stopped_early = False
         for c in selected:
-            r = backend.run_cell(path, c["cellID"])
+            r = backend.run_cell(path, c["cellID"], eval_timeout=eval_timeout)
             r["index"] = c.get("index")
             r["style"] = c.get("style")
             results.append(r)
@@ -571,6 +621,44 @@ def notebook_run_cells(
             "result_count": len(results),
             "stopped_early": stopped_early,
             "results": results,
+        }
+
+    return _backend_call(path, _do, timeout=timeout)
+
+
+@mcp.tool()
+def notebook_abort_evaluation(
+    path: str,
+    signal: str = "SIGINT",
+    clear_queue: bool = False,
+    timeout: float = 10.0,
+) -> dict:
+    """Signal the kernel to abort its current evaluation. Best-effort, not
+    fully autonomous.
+
+    Prefer `eval_timeout` on the call you're about to make — that's the
+    headless cross-platform mechanism. Use `notebook_abort_evaluation` only
+    when an eval is already in flight and the queued bridge can't reach it.
+
+    Behavior depends on mode and OS:
+    - **Solo mode, POSIX (Linux/macOS):** SIGINT is silent — the kernel calls
+      `Abort[]` at its next polling point. Headless.
+    - **Solo mode, Windows:** POSIX signal semantics differ; this is not
+      reliable. Use `eval_timeout` instead.
+    - **Collab mode, any OS:** signals the user's kernel, but the GUI front-end
+      typically intercepts SIGINT and pops a "Continue / Abort" dialog the user
+      must dismiss. Treat as "tap on the user's shoulder," not a clean abort.
+
+    SIGTERM is available but more forceful and may cause the kernel to exit;
+    only use it if SIGINT didn't work and you're prepared to lose kernel state.
+
+    `clear_queue=True` deletes pending `.wl` files in the bridge queue so the
+    scheduled task doesn't immediately pick up the next runaway (collab only).
+    """
+    def _do(backend):
+        return {
+            "mode": backend.mode,
+            **backend.abort_evaluation(signal=signal, clear_queue=clear_queue),
         }
 
     return _backend_call(path, _do, timeout=timeout)

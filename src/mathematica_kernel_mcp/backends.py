@@ -41,7 +41,9 @@ class Backend(ABC):
     def read(self, path: str) -> dict: ...
 
     @abstractmethod
-    def run_cell(self, path: str, cell_id) -> dict: ...
+    def run_cell(
+        self, path: str, cell_id, eval_timeout: float | None = None
+    ) -> dict: ...
 
     @abstractmethod
     def update_cell(
@@ -62,11 +64,18 @@ class Backend(ABC):
     def delete_cell(self, path: str, cell_id) -> dict: ...
 
     @abstractmethod
-    def evaluate(self, path: str, code: str) -> dict: ...
+    def evaluate(
+        self, path: str, code: str, eval_timeout: float | None = None
+    ) -> dict: ...
 
     @abstractmethod
     def eval_inline(
-        self, path: str, anchor_cell_id, code: str, cell_type: str = "Code"
+        self,
+        path: str,
+        anchor_cell_id,
+        code: str,
+        cell_type: str = "Code",
+        eval_timeout: float | None = None,
     ) -> dict: ...
 
     @abstractmethod
@@ -80,6 +89,15 @@ class Backend(ABC):
     def kernel_restart(self) -> dict: ...
     """Restart the underlying kernel. In collab mode this is refused (it would
     clobber the user's session). In solo mode it restarts the spawned kernel."""
+
+    @abstractmethod
+    def abort_evaluation(
+        self, signal: str = "SIGINT", clear_queue: bool = False
+    ) -> dict: ...
+    """Signal the kernel to abort its current evaluation. In collab mode this
+    sends SIGINT/SIGTERM to the user's kernel PID (the same mechanism the
+    Mathematica front-end uses for its Abort button). In solo mode this
+    signals the MCP-spawned kernel."""
 
 
 # ---------------------------------------------------------------------------
@@ -96,8 +114,8 @@ class BridgeBackend(Backend):
     def read(self, path: str) -> dict:
         return self.bridge.read_notebook(path)
 
-    def run_cell(self, path: str, cell_id) -> dict:
-        return self.bridge.run_cell(path, int(cell_id))
+    def run_cell(self, path: str, cell_id, eval_timeout: float | None = None) -> dict:
+        return self.bridge.run_cell(path, int(cell_id), eval_timeout=eval_timeout)
 
     def update_cell(self, path, cell_id, cell_type, content):
         return self.bridge.update_cell(path, int(cell_id), cell_type, content)
@@ -111,15 +129,18 @@ class BridgeBackend(Backend):
     def delete_cell(self, path, cell_id):
         return self.bridge.delete_cell(path, int(cell_id))
 
-    def evaluate(self, path, code):
-        return self.bridge.evaluate(code)
+    def evaluate(self, path, code, eval_timeout: float | None = None):
+        return self.bridge.evaluate(code, eval_timeout=eval_timeout)
 
-    def eval_inline(self, path, anchor_cell_id, code, cell_type="Code"):
+    def eval_inline(
+        self, path, anchor_cell_id, code, cell_type="Code",
+        eval_timeout: float | None = None,
+    ):
         ins = self.bridge.insert_cell_after(path, int(anchor_cell_id), cell_type, code)
         new_id = ins.get("newCellID")
         if new_id is None:
             return {"error": "insert_failed", "insert_result": ins}
-        run = self.bridge.run_cell(path, int(new_id))
+        run = self.bridge.run_cell(path, int(new_id), eval_timeout=eval_timeout)
         return {
             "status": run.get("status"),
             "newCellID": new_id,
@@ -145,6 +166,11 @@ class BridgeBackend(Backend):
                 "clobber their session. Ask the user to Quit Kernel themselves if needed."
             ),
         }
+
+    def abort_evaluation(
+        self, signal: str = "SIGINT", clear_queue: bool = False
+    ) -> dict:
+        return self.bridge.abort_evaluation(signal=signal, clear_queue=clear_queue)
 
 
 # ---------------------------------------------------------------------------
@@ -189,7 +215,7 @@ class SoloBackend(Backend):
             "cells": [_cell_to_payload(c) for c in cells],
         }
 
-    def run_cell(self, path, cell_id):
+    def run_cell(self, path, cell_id, eval_timeout: float | None = None):
         cells = self._parse(path)
         cell = self._resolve(cells, cell_id)
         if cell.cell_type not in {"Input", "Code"}:
@@ -199,7 +225,8 @@ class SoloBackend(Backend):
                 "reason": "not_executable",
                 "cellType": cell.cell_type,
             }
-        result = self.manager.evaluate(cell.content)
+        kwargs = {"timeout": int(eval_timeout)} if eval_timeout else {}
+        result = self.manager.evaluate(cell.content, **kwargs)
         return {
             "status": "ok",
             "cellID": cell.number,
@@ -275,8 +302,9 @@ class SoloBackend(Backend):
             removed = delete(path, cell_number=int(cell_id))
         return {"status": "ok", "deletedCellID": removed.number}
 
-    def evaluate(self, path, code):
-        result = self.manager.evaluate(code)
+    def evaluate(self, path, code, eval_timeout: float | None = None):
+        kwargs = {"timeout": int(eval_timeout)} if eval_timeout else {}
+        result = self.manager.evaluate(code, **kwargs)
         return {
             "status": "ok",
             "code": code,
@@ -289,13 +317,16 @@ class SoloBackend(Backend):
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
-    def eval_inline(self, path, anchor_cell_id, code, cell_type="Code"):
+    def eval_inline(
+        self, path, anchor_cell_id, code, cell_type="Code",
+        eval_timeout: float | None = None,
+    ):
         # Insert + run + return. The Input cell is persisted in the file (.m/.nb).
         ins = self.insert_cell_after(path, anchor_cell_id, cell_type, code)
         new_id = ins.get("newCellID")
         if new_id is None:
             return {"error": "insert_failed", "insert_result": ins}
-        run = self.run_cell(path, new_id)
+        run = self.run_cell(path, new_id, eval_timeout=eval_timeout)
         return {
             "status": run.get("status"),
             "newCellID": new_id,
@@ -317,6 +348,18 @@ class SoloBackend(Backend):
     def kernel_restart(self) -> dict:
         self.manager.restart_session("main")
         return {"status": "ok", "restarted": "main"}
+
+    def abort_evaluation(
+        self, signal: str = "SIGINT", clear_queue: bool = False
+    ) -> dict:
+        # `clear_queue` is collab-only (no file queue exists in solo mode); ignored here.
+        pid = self.manager.abort_session("main", signal=signal)
+        return {
+            "status": "ok",
+            "pid": pid,
+            "signal": signal.upper(),
+            "cleared_queue_files": [],
+        }
 
 
 # ---------------------------------------------------------------------------
