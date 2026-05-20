@@ -3,6 +3,7 @@
 import logging
 import os
 import signal as _signal
+import shutil
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -21,6 +22,18 @@ DEFAULT_SUMMARY_MAX = 500
 DEFAULT_TIMEOUT = 30
 # Kernel startup can be slow, especially on first launch
 KERNEL_STARTUP_TIMEOUT = 60
+
+
+def _default_kernel_path() -> str | None:
+    """Return an explicit kernel path when one is available from env/PATH."""
+    env_path = os.environ.get("WOLFRAM_KERNEL_PATH")
+    if env_path:
+        return env_path
+    for executable in ("WolframKernel", "MathKernel"):
+        found = shutil.which(executable)
+        if found:
+            return found
+    return None
 
 
 @dataclass
@@ -52,7 +65,7 @@ class SessionManager:
                         will attempt to find it automatically.
             startup_timeout: Seconds to wait for kernel startup.
         """
-        self._kernel_path = kernel_path
+        self._kernel_path = kernel_path or _default_kernel_path()
         self._startup_timeout = startup_timeout
         self._sessions: dict[str, ManagedSession] = {}
         self._lock = threading.Lock()
@@ -83,25 +96,29 @@ class SessionManager:
                     logger.warning("Failed to stop session %s", managed.name)
             self._sessions.clear()
 
+    def _create_session_locked(self, name: str) -> str:
+        """Create a new named kernel session. Caller must hold `_lock`."""
+        if name in self._sessions:
+            raise ValueError(f"Session '{name}' already exists")
+        session = self._create_kernel_session()
+        session.start()
+        pid: int | None
+        try:
+            pid = int(session.evaluate(wlexpr("$ProcessID")))
+        except Exception:
+            pid = None
+            logger.warning("Could not capture $ProcessID for session %s", name)
+        self._sessions[name] = ManagedSession(name=name, session=session, pid=pid)
+        logger.info("Created session '%s' (pid=%s)", name, pid)
+        return name
+
     def create_session(self, name: str) -> str:
         """Create a new named kernel session.
 
         Returns the session name.
         """
         with self._lock:
-            if name in self._sessions:
-                raise ValueError(f"Session '{name}' already exists")
-            session = self._create_kernel_session()
-            session.start()
-            pid: int | None
-            try:
-                pid = int(session.evaluate(wlexpr("$ProcessID")))
-            except Exception:
-                pid = None
-                logger.warning("Could not capture $ProcessID for session %s", name)
-            self._sessions[name] = ManagedSession(name=name, session=session, pid=pid)
-            logger.info("Created session '%s' (pid=%s)", name, pid)
-            return name
+            return self._create_session_locked(name)
 
     def close_session(self, name: str) -> None:
         """Close and remove a named session."""
@@ -118,6 +135,9 @@ class SessionManager:
         """Get a managed session by name."""
         with self._lock:
             managed = self._sessions.get(name)
+            if managed is None and name == "main":
+                self._create_session_locked(name)
+                managed = self._sessions[name]
             if managed is None:
                 raise ValueError(f"Session '{name}' does not exist")
             return managed
@@ -138,6 +158,7 @@ class SessionManager:
                         is_alive=alive,
                         is_busy=managed.is_busy,
                         out_count=managed.out_count,
+                        pid=managed.pid,
                     )
                 )
             return result
@@ -243,8 +264,12 @@ class SessionManager:
     ) -> str:
         """Evaluate code and return raw string result. For internal/inspection use."""
         managed = self.get_session(session_name)
-        result = managed.session.evaluate(wlexpr(code))
-        return str(result)
+        managed.is_busy = True
+        try:
+            result = managed.session.evaluate(wlexpr(code))
+            return str(result)
+        finally:
+            managed.is_busy = False
 
     def restart_session(self, name: str = "main") -> None:
         """Restart a kernel session (fresh state)."""

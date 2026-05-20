@@ -6,6 +6,11 @@ runs a cell, you see it live. In **solo mode** the MCP runs its own kernel and
 edits files on disk. Mode is auto-detected per file (collab if a
 `.shared_kernel_bridge/` directory sits next to the file).
 
+Collab mode now prefers an authenticated localhost socket transport, so normal
+tool calls do not rely on bidirectional filesystem polling. The original file
+queue transport is still available as a fallback with
+`StartSharedKernelBridge["Transport" -> "File"]`.
+
 ## Quick start
 
 Need: Mathematica 12.0+, Python 3.10+, an MCP-capable client (e.g.
@@ -39,8 +44,9 @@ Then in the notebook of the file you want to work on:
 StartSharedKernelBridge[]
 ```
 
-Open your LLM client and ask it to read or edit the file. The 19
-`notebook_*` tools are available.
+Open your LLM client and ask it to read or edit the file. The `notebook_*`
+tools operate on files/notebooks, and the `kernel_*` tools manage explicit
+agent-owned scratch kernels.
 
 ## Tools
 
@@ -52,14 +58,29 @@ Open your LLM client and ask it to read or edit the file. The 19
   `notebook_abort_evaluation`, `notebook_symbol_info`,
   `notebook_documentation_search`, `notebook_names`, `notebook_list_symbols`,
   `notebook_get_output`.
+- **Agent-owned scratch kernels**: `kernel_create`, `kernel_list`,
+  `kernel_eval`, `kernel_eval_json`, `kernel_state`, `kernel_get_output`,
+  `kernel_restart`, `kernel_abort`, `kernel_close`.
+
+Use scratch kernels for exploratory probes that should not pollute the user's
+live notebook kernel. `notebook_eval`, `notebook_run_cell`,
+`notebook_run_cells`, and `notebook_get_output` also accept `kernel_id` to
+route evaluation/output lookup through an explicit agent-owned kernel while
+still reading notebook cell contents from the target file.
 
 `cell_id` is opaque — pass back what you got from `notebook_read` /
 `notebook_search`. In collab it's a Mathematica `CellID` (stable); in solo
 it's a 1-indexed position (re-read after mutations).
 
-`StartSharedKernelBridge[]` defaults to a `.shared_kernel_bridge/` directory in
-`NotebookDirectory[]` and a 1s poll. Override with options if you really need
-to.
+`StartSharedKernelBridge[]` defaults to `"Transport" -> "Auto"`: it starts a
+localhost socket bridge when possible and falls back to the file queue if the
+socket listener cannot be created. Override with
+`"Transport" -> "Socket"` to require sockets or `"Transport" -> "File"` to use
+the legacy queue. In file mode, `"PollInterval" -> 1.0` controls queue polling.
+Socket responses are UTF-8 JSON with `Content-Length` framing, so large notebook
+reads do not depend on connection-close parsing. `notebook_read(...,
+include_content=False)` asks the bridge for previews only instead of moving full
+cell contents and discarding them client-side.
 
 ## Bounding evaluation time
 
@@ -99,9 +120,13 @@ isn't immediately followed by another runaway (collab only).
   (permanent).
 - Tool returns `bridge_unavailable` → no `.shared_kernel_bridge/` next to the
   file. Bootstrap the bridge in a notebook first.
-- Tool hangs / times out → bridge polling task may be dead.
-  `SharedKernelBridgeStatus[]` should show `Running -> True`. If not, re-run
-  `StartSharedKernelBridge[]`.
+- Collab calls return socket errors → check `SharedKernelBridgeStatus[]`.
+  If you need the old behavior while debugging, restart with
+  `StartSharedKernelBridge["Transport" -> "File"]`.
+- Tool hangs / times out → the bridge transport may be dead.
+  In socket mode, `SharedKernelBridgeStatus[]` should show
+  `Transport -> "Socket"` and `Running -> True`. In file mode, `Running -> True`
+  means the polling task is active. If not, re-run `StartSharedKernelBridge[]`.
 - Solo mode: "Cannot locate a kernel automatically" → `wolframclient` can't
   find the WolframKernel binary. Easier path is collab mode (uses Mathematica's
   own kernel via the bridge).
@@ -109,7 +134,6 @@ isn't immediately followed by another runaway (collab only).
 ## TODO
 
 - `.nb` end-to-end coverage.
-- Solo-mode: respect `WOLFRAM_KERNEL_PATH` env var.
 
 ## Contributing
 

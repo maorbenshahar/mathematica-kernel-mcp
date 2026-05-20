@@ -2,9 +2,10 @@
 
 Each tool dispatches at call time:
 
-- If `<file_dir>/.shared_kernel_bridge/queue/` exists, we use the live bridge
-  (collaborative mode) — edits land in the user's open notebook, kernel state
-  is shared with them.
+- If `<file_dir>/.shared_kernel_bridge/` exists, we use the live bridge
+  (collaborative mode) — preferably via authenticated localhost socket, with
+  the legacy file queue as fallback. Edits land in the user's open notebook,
+  kernel state is shared with them.
 - Otherwise we mutate the file on disk and run code in a kernel the MCP spawns
   itself (solo mode) — requires a locatable WolframKernel binary.
 
@@ -16,13 +17,15 @@ import logging
 import re as _re
 import unicodedata
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from textwrap import dedent
+from uuid import uuid4
 
 from fastmcp import FastMCP
 
 from mathematica_kernel_mcp.backends import get_backend_for
 from mathematica_kernel_mcp.bridge import BridgeError, BridgeTimeout
-from mathematica_kernel_mcp.session import SessionManager
+from mathematica_kernel_mcp.session import DEFAULT_TIMEOUT, SessionManager
 
 logger = logging.getLogger(__name__)
 
@@ -30,12 +33,11 @@ _manager: SessionManager | None = None
 
 
 def _manager_factory() -> SessionManager:
-    """Lazily create the embedded WolframKernel session (only used in solo mode)."""
+    """Lazily create the embedded WolframKernel manager for solo/scratch mode."""
     global _manager
     if _manager is None:
         _manager = SessionManager()
-        _manager.start()
-        logger.info("Embedded WolframKernel session started for solo mode")
+        logger.info("Embedded WolframKernel manager initialized for solo/scratch mode")
     return _manager
 
 
@@ -77,6 +79,105 @@ def _cell_preview(content: str, max_chars: int = 80) -> str:
     return flat if len(flat) <= max_chars else flat[: max_chars - 3] + "..."
 
 
+_KERNEL_ID_RE = _re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")
+_RESERVED_KERNEL_IDS = {"collab", "shared", "notebook"}
+
+
+def _validate_kernel_id(kernel_id: str) -> str:
+    kid = kernel_id.strip()
+    if not kid:
+        raise ValueError("kernel_id must be non-empty")
+    if kid in _RESERVED_KERNEL_IDS:
+        raise ValueError(
+            f"kernel_id {kid!r} is reserved; use an explicit scratch kernel name"
+        )
+    if not _KERNEL_ID_RE.match(kid):
+        raise ValueError(
+            "kernel_id must start with a letter and contain only letters, "
+            "digits, '_', '-', or '.', max length 64"
+        )
+    return kid
+
+
+def _kernel_timeout(eval_timeout: float | None) -> int:
+    if eval_timeout is None:
+        return DEFAULT_TIMEOUT
+    if eval_timeout <= 0:
+        raise ValueError("eval_timeout must be positive when provided")
+    return max(1, int(eval_timeout))
+
+
+def _session_payload(info) -> dict:
+    return {
+        "kernel_id": info.name,
+        "owner": "agent",
+        "is_alive": info.is_alive,
+        "is_busy": info.is_busy,
+        "out_count": info.out_count,
+        "pid": info.pid,
+    }
+
+
+def _kernel_eval_payload(
+    manager: SessionManager,
+    kernel_id: str,
+    code: str,
+    *,
+    eval_timeout: float | None = None,
+    summary_max: int = 500,
+) -> dict:
+    kid = _validate_kernel_id(kernel_id)
+    result = manager.evaluate(
+        code,
+        session_name=kid,
+        timeout=_kernel_timeout(eval_timeout),
+        summary_max=summary_max,
+    )
+    return {
+        "status": "ok",
+        "kernel_id": kid,
+        "owner": "agent",
+        "code": code,
+        "resultInputForm": result.output_summary,
+        "messages": result.messages,
+        "in_number": result.in_number,
+        "out_number": result.out_number,
+        "head": result.head,
+        "byte_size": result.byte_size,
+        "leaf_count": result.leaf_count,
+        "is_truncated": result.is_truncated,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _kernel_eval_json(
+    manager: SessionManager,
+    kernel_id: str,
+    code: str,
+    *,
+    eval_timeout: float | None = None,
+):
+    kid = _validate_kernel_id(kernel_id)
+    timeout = _kernel_timeout(eval_timeout)
+    expr = f"TimeConstrained[({code}), {timeout}, $Aborted]"
+    raw = manager.evaluate_raw(
+        f'ExportString[({expr}), "RawJSON"]',
+        session_name=kid,
+    )
+    return json.loads(raw)
+
+
+def _kernel_call(fn) -> dict:
+    try:
+        return fn()
+    except ValueError as exc:
+        return {"error": "value_error", "message": str(exc)}
+    except json.JSONDecodeError as exc:
+        return {"error": "json_decode_error", "message": str(exc)}
+    except Exception as exc:
+        return {"error": "kernel_error", "message": str(exc)}
+
+
 mcp = FastMCP(
     "mathematica-kernel-mcp",
     instructions="""MCP server for collaborative or solo Mathematica/Wolfram Language development.
@@ -84,9 +185,10 @@ mcp = FastMCP(
 ## Two modes (auto-detected per file)
 - **Collaborative**: a `.shared_kernel_bridge/` directory next to the target file
   indicates the user has Mathematica open with the file and has evaluated
-  `<< SharedKernelMCP`` + `StartSharedKernelBridge[]`. You drive a kernel they
-  share with you, edits land live in their open notebook, and they see your
-  activity in real time.
+  `<< SharedKernelMCP`` + `StartSharedKernelBridge[]`. The bridge uses an
+  authenticated localhost socket when available, falling back to the legacy
+  file queue. You drive a kernel they share with you, edits land live in their
+  open notebook, and they see your activity in real time.
 - **Solo**: no bridge. Files are mutated on disk; code runs in a kernel the
   MCP spawns via `wolframclient`. Requires a locatable WolframKernel binary.
 
@@ -122,6 +224,16 @@ bridge is present next to the file you pass in.
 - `notebook_list_symbols(path, context="Global`")` — symbols by context.
 - `notebook_get_output(path, out_number, view="full"|"short"|"summary")` —
   inspect a previous `Out[n]` (full / shallow / metadata).
+
+## Agent-owned scratch kernels
+- `kernel_create(kernel_id?)`, `kernel_list`, `kernel_eval`, `kernel_eval_json`,
+  `kernel_state`, `kernel_restart`, `kernel_abort`, `kernel_close`, and
+  `kernel_get_output` manage explicit agent-owned kernels. Use these for probes
+  that should not pollute the user's shared notebook kernel.
+- `notebook_eval(..., kernel_id=...)`, `notebook_run_cell(..., kernel_id=...)`,
+  and `notebook_run_cells(..., kernel_id=...)` route evaluation into the named
+  scratch kernel while still reading notebook cell contents from the selected
+  file/notebook. No visible notebook Output is written in this mode.
 
 ## Bounding evaluation time
 The run-style tools (`notebook_run_cell`, `notebook_run_cells`, `notebook_eval`,
@@ -167,14 +279,21 @@ def notebook_read(
     - `preview_chars`: max chars per preview when `include_content=False`.
     """
     def _do(backend):
-        result = backend.read(path)
+        result = backend.read(
+            path,
+            include_content=include_content,
+            preview_chars=preview_chars,
+        )
         all_cells = result.get("cells", [])
         if cells is not None:
             wanted = set(cells)
             all_cells = [c for c in all_cells if c.get("cellID") in wanted]
         if not include_content:
             for c in all_cells:
-                c["preview"] = _cell_preview(c.get("content", ""), preview_chars)
+                c["preview"] = c.get(
+                    "preview",
+                    _cell_preview(c.get("content", ""), preview_chars),
+                )
                 c.pop("content", None)
         result["cells"] = all_cells
         result["cell_count"] = len(all_cells)
@@ -275,6 +394,7 @@ def notebook_run_cell(
     cell_id: int,
     timeout: float = 60.0,
     eval_timeout: float | None = None,
+    kernel_id: str | None = None,
 ) -> dict:
     """Evaluate the cell with the given cellID.
 
@@ -282,11 +402,29 @@ def notebook_run_cell(
     (replacing any prior bridge-tagged output for the same cell). In solo mode,
     the result is returned but no notebook is updated.
 
+    If `kernel_id` is provided, the cell content is read from the notebook/file
+    but evaluated in that agent-owned scratch kernel. No visible notebook Output
+    is written in this mode.
+
     `timeout` bounds how long Python waits for the result file (bridge-side).
     `eval_timeout` (seconds) is enforced kernel-side via TimeConstrained: when
     set, an evaluation exceeding it is aborted and returned with status="timeout".
     Use `eval_timeout` proactively when you don't trust a computation to finish.
     """
+    if kernel_id is not None:
+        def _scratch(backend):
+            result = backend.read(path)
+            cell = _find_cell_payload(result.get("cells", []), cell_id)
+            return _run_cell_in_kernel_payload(
+                path=path,
+                source_mode=backend.mode,
+                cell=cell,
+                kernel_id=kernel_id,
+                eval_timeout=eval_timeout,
+            )
+
+        return _backend_call(path, _scratch, timeout=timeout)
+
     return _backend_call(
         path,
         lambda b: b.run_cell(path, cell_id, eval_timeout=eval_timeout),
@@ -360,6 +498,7 @@ def notebook_eval(
     code: str,
     timeout: float = 60.0,
     eval_timeout: float | None = None,
+    kernel_id: str | None = None,
 ) -> dict:
     """Evaluate WL code SILENTLY (no notebook trace).
 
@@ -367,9 +506,28 @@ def notebook_eval(
     messages, etc. Use `notebook_eval_inline` instead when the user should see
     the input + output.
 
+    If `kernel_id` is provided, evaluation goes to that explicit agent-owned
+    kernel instead of the file's collab/solo backend. This is the safest route
+    for scratch probes that should not alter the user's shared notebook kernel.
+
     `eval_timeout` (seconds) wraps the eval in TimeConstrained kernel-side; on
     expiry, status="timeout".
     """
+    if kernel_id is not None:
+        return _kernel_call(
+            lambda: {
+                **_kernel_eval_payload(
+                    _manager_factory(),
+                    kernel_id,
+                    code,
+                    eval_timeout=eval_timeout,
+                ),
+                "path": path,
+                "mode": "scratch",
+                "visible_output": False,
+            }
+        )
+
     return _backend_call(
         path,
         lambda b: b.evaluate(path, code, eval_timeout=eval_timeout),
@@ -553,6 +711,282 @@ def _normalize_context_query(context: str) -> tuple[str, str]:
     return n, f"{n}*"
 
 
+def _find_cell_payload(cells: list[dict], cell_id: int) -> dict:
+    for c in cells:
+        if c.get("cellID") == cell_id or str(c.get("cellID")) == str(cell_id):
+            return c
+    raise ValueError(f"cellID {cell_id} not found")
+
+
+def _run_cell_in_kernel_payload(
+    *,
+    path: str,
+    source_mode: str,
+    cell: dict,
+    kernel_id: str,
+    eval_timeout: float | None = None,
+) -> dict:
+    if cell.get("style") not in _EXECUTABLE_CELL_TYPES:
+        return {
+            "status": "skipped",
+            "path": path,
+            "mode": "scratch",
+            "source_mode": source_mode,
+            "kernel_id": _validate_kernel_id(kernel_id),
+            "cellID": cell.get("cellID"),
+            "index": cell.get("index"),
+            "reason": "not_executable",
+            "cellType": cell.get("style"),
+            "visible_output": False,
+        }
+    result = _kernel_eval_payload(
+        _manager_factory(),
+        kernel_id,
+        cell.get("content", ""),
+        eval_timeout=eval_timeout,
+    )
+    result.update(
+        {
+            "path": path,
+            "mode": "scratch",
+            "source_mode": source_mode,
+            "cellID": cell.get("cellID"),
+            "index": cell.get("index"),
+            "style": cell.get("style"),
+            "visible_output": False,
+        }
+    )
+    return result
+
+
+@mcp.tool()
+def kernel_list() -> dict:
+    """List agent-owned Wolfram kernels managed by the MCP process.
+
+    This does not include user-owned collaborative notebook kernels; those are
+    addressed by notebook path through the `notebook_*` tools.
+    """
+    if _manager is None:
+        return {
+            "status": "ok",
+            "kernel_count": 0,
+            "kernels": [],
+            "note": "No agent-owned kernel manager has been started yet.",
+        }
+    return {
+        "status": "ok",
+        "kernel_count": len(_manager.list_sessions()),
+        "kernels": [_session_payload(info) for info in _manager.list_sessions()],
+    }
+
+
+@mcp.tool()
+def kernel_create(kernel_id: str | None = None) -> dict:
+    """Create an explicit agent-owned scratch kernel.
+
+    If `kernel_id` is omitted, a `scratch-<hex>` ID is generated. Scratch
+    kernels are isolated from the lazy default `main` solo kernel and from any
+    user-owned collab notebook kernel.
+    """
+    def _do():
+        manager = _manager_factory()
+        if kernel_id is None:
+            existing = {info.name for info in manager.list_sessions()}
+            while True:
+                kid = f"scratch-{uuid4().hex[:8]}"
+                if kid not in existing:
+                    break
+        else:
+            kid = _validate_kernel_id(kernel_id)
+        manager.create_session(kid)
+        info = next(
+            (i for i in manager.list_sessions() if i.name == kid),
+            None,
+        )
+        return {"status": "ok", "kernel": _session_payload(info)}
+
+    return _kernel_call(_do)
+
+
+@mcp.tool()
+def kernel_close(kernel_id: str) -> dict:
+    """Close an agent-owned scratch kernel.
+
+    The built-in `main` kernel cannot be closed; use `kernel_restart("main")`
+    if you need a fresh default solo kernel.
+    """
+    def _do():
+        if _manager is None:
+            raise ValueError("No agent-owned kernel manager has been started")
+        kid = _validate_kernel_id(kernel_id)
+        _manager.close_session(kid)
+        return {"status": "ok", "closed": kid}
+
+    return _kernel_call(_do)
+
+
+@mcp.tool()
+def kernel_restart(kernel_id: str = "main") -> dict:
+    """Restart an agent-owned kernel, clearing its definitions and outputs."""
+    def _do():
+        if _manager is None:
+            raise ValueError("No agent-owned kernel manager has been started")
+        kid = _validate_kernel_id(kernel_id)
+        _manager.restart_session(kid)
+        return {"status": "ok", "restarted": kid}
+
+    return _kernel_call(_do)
+
+
+@mcp.tool()
+def kernel_abort(kernel_id: str, signal: str = "SIGINT") -> dict:
+    """Signal an agent-owned kernel to abort its current evaluation."""
+    def _do():
+        if _manager is None:
+            raise ValueError("No agent-owned kernel manager has been started")
+        kid = _validate_kernel_id(kernel_id)
+        pid = _manager.abort_session(kid, signal=signal)
+        return {"status": "ok", "kernel_id": kid, "pid": pid, "signal": signal.upper()}
+
+    return _kernel_call(_do)
+
+
+@mcp.tool()
+def kernel_eval(
+    kernel_id: str,
+    code: str,
+    eval_timeout: float | None = None,
+    summary_max: int = 500,
+) -> dict:
+    """Evaluate Wolfram Language code in an explicit agent-owned kernel.
+
+    Use this for scratch probes that should not modify the user's shared
+    notebook kernel. Create a scratch kernel first with `kernel_create`.
+    """
+    return _kernel_call(
+        lambda: _kernel_eval_payload(
+            _manager_factory(),
+            kernel_id,
+            code,
+            eval_timeout=eval_timeout,
+            summary_max=summary_max,
+        )
+    )
+
+
+@mcp.tool()
+def kernel_eval_json(
+    kernel_id: str,
+    code: str,
+    eval_timeout: float | None = None,
+) -> dict:
+    """Evaluate WL code in an agent-owned kernel and return RawJSON-decoded output."""
+    return _kernel_call(
+        lambda: {
+            "status": "ok",
+            "kernel_id": _validate_kernel_id(kernel_id),
+            "result": _kernel_eval_json(
+                _manager_factory(),
+                kernel_id,
+                code,
+                eval_timeout=eval_timeout,
+            ),
+        }
+    )
+
+
+@mcp.tool()
+def kernel_state(
+    kernel_id: str,
+    fields: list[str] | None = None,
+) -> dict:
+    """Return structured state for an explicit agent-owned kernel."""
+    def _do():
+        manager = _manager_factory()
+        kid = _validate_kernel_id(kernel_id)
+        if fields is None:
+            wanted = list(_DEFAULT_KERNEL_STATE_FIELDS)
+        else:
+            invalid = sorted(set(fields) - set(_KERNEL_STATE_FIELDS))
+            if invalid:
+                raise ValueError(
+                    f"Unsupported kernel_state fields: {', '.join(invalid)}"
+                )
+            wanted = list(fields)
+        selected_exprs = ", ".join(
+            f'"{name}" -> {_KERNEL_STATE_FIELDS[name]}' for name in wanted
+        )
+        expr = f"<|{selected_exprs}|>"
+        return {
+            "status": "ok",
+            "kernel_id": kid,
+            "state": _kernel_eval_json(manager, kid, expr),
+        }
+
+    return _kernel_call(_do)
+
+
+@mcp.tool()
+def kernel_get_output(
+    kernel_id: str,
+    out_number: int,
+    view: str = "full",
+    max_chars: int = 2000,
+    depth: int = 3,
+) -> dict:
+    """Inspect a previous result stored by `kernel_eval` in an agent-owned kernel."""
+    def _do():
+        if view not in _GET_OUTPUT_VIEWS:
+            raise ValueError(
+                f"Unsupported view '{view}'. Use one of: {sorted(_GET_OUTPUT_VIEWS)}"
+            )
+        kid = _validate_kernel_id(kernel_id)
+        manager = _manager_factory()
+        ref = f"wolfram$mcp$out[{int(out_number)}]"
+        if view == "summary":
+            expr = dedent(
+                f"""
+                With[{{res = {ref}}},
+                    <|
+                        "head" -> ToString[Head[res]],
+                        "leaf_count" -> LeafCount[res],
+                        "depth" -> Depth[res],
+                        "byte_count" -> ByteCount[res],
+                        "dimensions" -> Quiet[Check[Dimensions[res], Null]]
+                    |>
+                ]
+                """
+            )
+            return {
+                "status": "ok",
+                "kernel_id": kid,
+                "out_number": out_number,
+                "view": view,
+                "summary": _kernel_eval_json(manager, kid, expr),
+            }
+        if view == "full":
+            wl = f"ToString[{ref}, InputForm]"
+        else:
+            wl = f"ToString[Shallow[{ref}, {{{depth}, 3}}], OutputForm]"
+        raw = manager.evaluate_raw(wl, session_name=kid)
+        is_truncated = len(raw) > max_chars
+        if is_truncated:
+            raw = raw[:max_chars] + "..."
+        result = {
+            "status": "ok",
+            "kernel_id": kid,
+            "out_number": out_number,
+            "view": view,
+            "output": raw,
+            "is_truncated": is_truncated,
+        }
+        if view == "short":
+            result["depth"] = depth
+        return result
+
+    return _kernel_call(_do)
+
+
 @mcp.tool()
 def notebook_run_cells(
     path: str,
@@ -563,6 +997,7 @@ def notebook_run_cells(
     stop_on_error: bool = True,
     timeout: float = 60.0,
     eval_timeout: float | None = None,
+    kernel_id: str | None = None,
 ) -> dict:
     """Run multiple cells in order in a single MCP call.
 
@@ -576,6 +1011,8 @@ def notebook_run_cells(
     selection happens in one read instead of per call.
 
     `eval_timeout` (seconds) applies to each cell individually via TimeConstrained.
+    If `kernel_id` is provided, selected cells are evaluated in that agent-owned
+    scratch kernel and no visible notebook Output is written.
     """
     def _do(backend):
         all_cells = backend.read(path).get("cells", [])
@@ -606,7 +1043,16 @@ def notebook_run_cells(
         results: list[dict] = []
         stopped_early = False
         for c in selected:
-            r = backend.run_cell(path, c["cellID"], eval_timeout=eval_timeout)
+            if kernel_id is None:
+                r = backend.run_cell(path, c["cellID"], eval_timeout=eval_timeout)
+            else:
+                r = _run_cell_in_kernel_payload(
+                    path=path,
+                    source_mode=backend.mode,
+                    cell=c,
+                    kernel_id=kernel_id,
+                    eval_timeout=eval_timeout,
+                )
             r["index"] = c.get("index")
             r["style"] = c.get("style")
             results.append(r)
@@ -614,14 +1060,25 @@ def notebook_run_cells(
                 stopped_early = True
                 break
 
-        return {
+        payload = {
             "status": "ok",
             "path": path,
-            "mode": backend.mode,
             "result_count": len(results),
             "stopped_early": stopped_early,
             "results": results,
         }
+        if kernel_id is None:
+            payload["mode"] = backend.mode
+        else:
+            payload.update(
+                {
+                    "mode": "scratch",
+                    "source_mode": backend.mode,
+                    "kernel_id": _validate_kernel_id(kernel_id),
+                    "visible_output": False,
+                }
+            )
+        return payload
 
     return _backend_call(path, _do, timeout=timeout)
 
@@ -947,6 +1404,7 @@ def notebook_get_output(
     max_chars: int = 2000,
     depth: int = 3,
     timeout: float = 30.0,
+    kernel_id: str | None = None,
 ) -> dict:
     """Inspect a previous evaluation's `Out[n]` value.
 
@@ -954,7 +1412,19 @@ def notebook_get_output(
     - `"full"`: full InputForm string (truncated at `max_chars`).
     - `"short"`: `Shallow` rendering at `depth` (truncated at `max_chars`).
     - `"summary"`: structured `<|head, leaf_count, depth, byte_count, dimensions|>`.
+
+    If `kernel_id` is provided, this inspects the agent-owned kernel's stored
+    `kernel_eval` output instead of the file/notebook backend.
     """
+    if kernel_id is not None:
+        return kernel_get_output(
+            kernel_id=kernel_id,
+            out_number=out_number,
+            view=view,
+            max_chars=max_chars,
+            depth=depth,
+        )
+
     if view not in _GET_OUTPUT_VIEWS:
         return {"error": f"Unsupported view '{view}'. Use one of: {sorted(_GET_OUTPUT_VIEWS)}"}
 

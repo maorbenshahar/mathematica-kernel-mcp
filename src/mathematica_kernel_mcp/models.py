@@ -51,3 +51,4 @@ class SessionInfo:
     memory_used: int = 0  # bytes
     loaded_packages: list[str] = field(default_factory=list)
     out_count: int = 0  # number of Out[] entries
+    pid: int | None = None

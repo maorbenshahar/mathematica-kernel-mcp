@@ -5,13 +5,13 @@ based on whether a shared-kernel bridge is present:
 
 - `BridgeBackend` (collaborative): the user has Mathematica open with the file +
   `StartSharedKernelBridge[...]` evaluated. We talk to the user's kernel via the
-  file-based queue/results protocol; edits land live in their open notebook;
-  kernel state is shared.
+  authenticated socket bridge when available, with the file queue as fallback;
+  edits land live in their open notebook; kernel state is shared.
 - `SoloBackend` (solo): no bridge. We mutate the `.m`/`.nb` file on disk and run
   code in a kernel the MCP spawns via wolframclient. The user is not involved.
 
 A `get_backend_for(path)` dispatcher picks the right backend based on whether
-`<file_dir>/.shared_kernel_bridge/queue/` exists next to the target file.
+`<file_dir>/.shared_kernel_bridge/<filename>/` exists next to the target file.
 """
 
 from __future__ import annotations
@@ -38,7 +38,13 @@ class Backend(ABC):
     mode: str  # "collab" | "solo"
 
     @abstractmethod
-    def read(self, path: str) -> dict: ...
+    def read(
+        self,
+        path: str,
+        *,
+        include_content: bool = True,
+        preview_chars: int = 80,
+    ) -> dict: ...
 
     @abstractmethod
     def run_cell(
@@ -111,8 +117,18 @@ class BridgeBackend(Backend):
     def __init__(self, path: str, timeout: float = 30.0):
         self.bridge = SharedKernelBridge.for_file(path, timeout=timeout)
 
-    def read(self, path: str) -> dict:
-        return self.bridge.read_notebook(path)
+    def read(
+        self,
+        path: str,
+        *,
+        include_content: bool = True,
+        preview_chars: int = 80,
+    ) -> dict:
+        return self.bridge.read_notebook(
+            path,
+            include_content=include_content,
+            preview_chars=preview_chars,
+        )
 
     def run_cell(self, path: str, cell_id, eval_timeout: float | None = None) -> dict:
         return self.bridge.run_cell(path, int(cell_id), eval_timeout=eval_timeout)
@@ -207,12 +223,28 @@ class SoloBackend(Backend):
                 return c
         raise ValueError(f"cell {cid} not found (file has {len(cells)} cells)")
 
-    def read(self, path):
+    def read(
+        self,
+        path,
+        *,
+        include_content: bool = True,
+        preview_chars: int = 80,
+    ):
         cells = self._parse(path)
+        payload_cells = [_cell_to_payload(c) for c in cells]
+        if not include_content:
+            for c in payload_cells:
+                flat = c.get("content", "").replace("\n", " ")
+                c["preview"] = (
+                    flat
+                    if len(flat) <= preview_chars
+                    else flat[: max(0, preview_chars - 3)] + "..."
+                )
+                c.pop("content", None)
         return {
             "status": "ok",
             "path": path,
-            "cells": [_cell_to_payload(c) for c in cells],
+            "cells": payload_cells,
         }
 
     def run_cell(self, path, cell_id, eval_timeout: float | None = None):
