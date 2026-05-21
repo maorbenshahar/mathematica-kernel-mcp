@@ -1,103 +1,95 @@
 import json
+import os
 import socket
 import threading
 
 import pytest
 
-from mathematica_kernel_mcp.bridge import BridgeError, SharedKernelBridge
+from mathematica_kernel_mcp.bridge import (
+    REGISTRY_ENV_VAR,
+    BridgeError,
+    SharedKernelBridge,
+    SocketConnection,
+    bridge_record_for_file,
+    discover_bridge_records,
+)
 
 
-def make_bridge_root(tmp_path):
-    (tmp_path / "queue").mkdir()
-    (tmp_path / "results").mkdir()
-    return tmp_path
+def isolate_registry(monkeypatch, tmp_path):
+    registry = tmp_path / "registry"
+    registry.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv(REGISTRY_ENV_VAR, str(registry))
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("APPDATA", raising=False)
+    return registry
 
 
-def write_connection(root, **overrides):
+def write_registry_record(registry, **overrides):
     payload = {
-        "transport": "socket",
+        "schemaVersion": 2,
+        "transport": "Socket",
         "protocol": "jsonl-content-length-v1",
         "host": "127.0.0.1",
         "port": 54321,
         "token": "secret",
+        "kernelPID": os.getpid(),
+        "notebookPath": "/tmp/demo.nb",
+        "notebooks": [{"path": "/tmp/demo.nb"}],
+        "createdAt": "2026-05-20 12:00:00",
+        "lastSeen": "2026-05-20 12:00:00",
     }
     payload.update(overrides)
-    (root / "connection.json").write_text(json.dumps(payload), encoding="utf-8")
+    path = registry / overrides.get("filename", "bridge.json")
+    payload.pop("filename", None)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
 
 
 def framed_response(payload: bytes) -> bytes:
     return b"Content-Length: " + str(len(payload)).encode("ascii") + b"\r\n\r\n" + payload
 
 
-def test_socket_connection_metadata_is_loaded(tmp_path):
-    root = make_bridge_root(tmp_path)
-    write_connection(root)
-
-    bridge = SharedKernelBridge(root)
-
-    assert bridge.socket_connection is not None
-    assert bridge.socket_connection.host == "127.0.0.1"
-    assert bridge.socket_connection.port == 54321
-    assert bridge.socket_connection.token == "secret"
-    assert bridge.socket_connection.protocol == "jsonl-content-length-v1"
-
-
-def test_non_socket_connection_metadata_is_ignored(tmp_path):
-    root = make_bridge_root(tmp_path)
-    write_connection(root, transport="file")
-
-    bridge = SharedKernelBridge(root)
-
-    assert bridge.socket_connection is None
+def serve_once(response: bytes, received: dict, ready: threading.Event):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        received["port"] = server.getsockname()[1]
+        ready.set()
+        conn, _ = server.accept()
+        with conn:
+            data = b""
+            while not data.endswith(b"\n"):
+                data += conn.recv(4096)
+            received["request"] = json.loads(data.decode("utf-8"))
+            conn.sendall(response)
 
 
-def test_socket_connection_must_be_loopback(tmp_path):
-    root = make_bridge_root(tmp_path)
-    write_connection(root, host="203.0.113.10")
-
-    with pytest.raises(BridgeError, match="loopback"):
-        SharedKernelBridge(root)
-
-
-def test_socket_connection_requires_valid_port_and_token(tmp_path):
-    root = make_bridge_root(tmp_path)
-    write_connection(root, port=70000)
-
-    with pytest.raises(BridgeError, match="invalid port or token"):
-        SharedKernelBridge(root)
-
-
-def test_socket_call_sends_authenticated_json_line(tmp_path):
-    root = make_bridge_root(tmp_path)
+def test_socket_call_sends_authenticated_json_line():
     received = {}
     ready = threading.Event()
-
-    def serve_once():
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
-            server.bind(("127.0.0.1", 0))
-            server.listen(1)
-            received["port"] = server.getsockname()[1]
-            ready.set()
-            conn, _ = server.accept()
-            with conn:
-                data = b""
-                while not data.endswith(b"\n"):
-                    data += conn.recv(4096)
-                received["request"] = json.loads(data.decode("utf-8"))
-                conn.sendall(framed_response(
-                    b'{\n'
-                    b'  "status":"ok",\n'
-                    b'  "resultInputForm":"2",\n'
-                    b'  "resultJSON":2\n'
-                    b'}\n'
-                ))
-
-    thread = threading.Thread(target=serve_once)
+    thread = threading.Thread(
+        target=serve_once,
+        args=(
+            framed_response(
+                b'{\n'
+                b'  "status":"ok",\n'
+                b'  "resultInputForm":"2",\n'
+                b'  "resultJSON":2\n'
+                b'}\n'
+            ),
+            received,
+            ready,
+        ),
+    )
     thread.start()
     assert ready.wait(timeout=5)
-    write_connection(root, port=received["port"])
 
-    bridge = SharedKernelBridge(root, timeout=5)
+    bridge = SharedKernelBridge(
+        SocketConnection("127.0.0.1", received["port"], "secret"),
+        timeout=5,
+    )
     result = bridge.evaluate("1+1")
 
     thread.join(timeout=5)
@@ -107,31 +99,25 @@ def test_socket_call_sends_authenticated_json_line(tmp_path):
     assert received["request"]["code"] == "(*SILENT*)\n1+1"
 
 
-def test_socket_call_supports_legacy_unframed_response(tmp_path):
-    root = make_bridge_root(tmp_path)
+def test_socket_call_supports_unframed_response():
     received = {}
     ready = threading.Event()
-
-    def serve_once():
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
-            server.bind(("127.0.0.1", 0))
-            server.listen(1)
-            received["port"] = server.getsockname()[1]
-            ready.set()
-            conn, _ = server.accept()
-            with conn:
-                data = b""
-                while not data.endswith(b"\n"):
-                    data += conn.recv(4096)
-                received["request"] = json.loads(data.decode("utf-8"))
-                conn.sendall(b'{"status":"ok","resultJSON":4}\n')
-
-    thread = threading.Thread(target=serve_once)
+    thread = threading.Thread(
+        target=serve_once,
+        args=(b'{"status":"ok","resultJSON":4}\n', received, ready),
+    )
     thread.start()
     assert ready.wait(timeout=5)
-    write_connection(root, port=received["port"], protocol="json-lines")
 
-    bridge = SharedKernelBridge(root, timeout=5)
+    bridge = SharedKernelBridge(
+        SocketConnection(
+            "127.0.0.1",
+            received["port"],
+            "secret",
+            protocol="json-lines",
+        ),
+        timeout=5,
+    )
     result = bridge.evaluate("2+2")
 
     thread.join(timeout=5)
@@ -139,91 +125,117 @@ def test_socket_call_supports_legacy_unframed_response(tmp_path):
     assert result["resultJSON"] == 4
 
 
-def test_socket_call_rejects_truncated_framed_response(tmp_path):
-    root = make_bridge_root(tmp_path)
+def test_socket_call_rejects_truncated_framed_response():
+    received = {}
     ready = threading.Event()
-
-    def serve_once():
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
-            server.bind(("127.0.0.1", 0))
-            server.listen(1)
-            port = server.getsockname()[1]
-            write_connection(root, port=port)
-            ready.set()
-            conn, _ = server.accept()
-            with conn:
-                while not conn.recv(4096).endswith(b"\n"):
-                    pass
-                conn.sendall(b"Content-Length: 10\r\n\r\n{}")
-
-    thread = threading.Thread(target=serve_once)
+    thread = threading.Thread(
+        target=serve_once,
+        args=(b"Content-Length: 10\r\n\r\n{}", received, ready),
+    )
     thread.start()
     assert ready.wait(timeout=5)
 
-    bridge = SharedKernelBridge(root, timeout=5)
+    bridge = SharedKernelBridge(
+        SocketConnection("127.0.0.1", received["port"], "secret"),
+        timeout=5,
+    )
     with pytest.raises(BridgeError, match="expected 10"):
         bridge.evaluate("1")
 
     thread.join(timeout=5)
 
 
-def test_compact_read_uses_new_bridge_signature_for_v2_socket(tmp_path):
-    root = make_bridge_root(tmp_path)
+def test_compact_read_uses_preview_bridge_signature():
     received = {}
     ready = threading.Event()
-
-    def serve_once():
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
-            server.bind(("127.0.0.1", 0))
-            server.listen(1)
-            received["port"] = server.getsockname()[1]
-            ready.set()
-            conn, _ = server.accept()
-            with conn:
-                data = b""
-                while not data.endswith(b"\n"):
-                    data += conn.recv(4096)
-                received["request"] = json.loads(data.decode("utf-8"))
-                conn.sendall(framed_response(b'{"status":"ok","resultJSON":{"cells":[]}}'))
-
-    thread = threading.Thread(target=serve_once)
+    thread = threading.Thread(
+        target=serve_once,
+        args=(
+            framed_response(b'{"status":"ok","resultJSON":{"cells":[]}}'),
+            received,
+            ready,
+        ),
+    )
     thread.start()
     assert ready.wait(timeout=5)
-    write_connection(root, port=received["port"])
 
-    bridge = SharedKernelBridge(root, timeout=5)
+    bridge = SharedKernelBridge(
+        SocketConnection("127.0.0.1", received["port"], "secret"),
+        timeout=5,
+    )
     bridge.read_notebook("/tmp/test.nb", include_content=False, preview_chars=17)
 
     thread.join(timeout=5)
+    assert "(*FULLJSON*)" in received["request"]["code"]
     assert 'BridgeReadNotebook["/tmp/test.nb", False, 17]' in received["request"]["code"]
 
 
-def test_compact_read_keeps_legacy_bridge_signature_for_old_socket(tmp_path):
-    root = make_bridge_root(tmp_path)
+def test_registry_records_are_discovered_and_tokens_are_redacted(tmp_path, monkeypatch):
+    registry = isolate_registry(monkeypatch, tmp_path)
+    notebook = tmp_path / "notebooks" / "demo.nb"
+    notebook.parent.mkdir()
+    notebook.write_text("Notebook[{}]", encoding="utf-8")
+    write_registry_record(registry, notebookPath=str(notebook), notebooks=[{"path": str(notebook)}])
+
+    records = discover_bridge_records()
+
+    assert len(records) == 1
+    assert records[0]["is_alive"] is True
+    assert records[0]["socket_ok"] is True
+    assert "token" not in records[0]
+
+    redacted = bridge_record_for_file(notebook, include_tokens=False)
+    assert redacted is not None
+    assert "token" not in redacted
+
+    full = bridge_record_for_file(notebook, include_tokens=True)
+    assert full is not None
+    assert full["token"] == "secret"
+
+
+def test_for_file_falls_back_to_registry_record(tmp_path, monkeypatch):
+    registry = isolate_registry(monkeypatch, tmp_path)
+    notebook = tmp_path / "registry-only.nb"
+    notebook.write_text("Notebook[{}]", encoding="utf-8")
     received = {}
     ready = threading.Event()
-
-    def serve_once():
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
-            server.bind(("127.0.0.1", 0))
-            server.listen(1)
-            received["port"] = server.getsockname()[1]
-            ready.set()
-            conn, _ = server.accept()
-            with conn:
-                data = b""
-                while not data.endswith(b"\n"):
-                    data += conn.recv(4096)
-                received["request"] = json.loads(data.decode("utf-8"))
-                conn.sendall(b'{"status":"ok","resultJSON":{"cells":[]}}\n')
-
-    thread = threading.Thread(target=serve_once)
+    thread = threading.Thread(
+        target=serve_once,
+        args=(framed_response(b'{"status":"ok","resultJSON":5}'), received, ready),
+    )
     thread.start()
     assert ready.wait(timeout=5)
-    write_connection(root, port=received["port"], protocol="json-lines")
+    write_registry_record(
+        registry,
+        notebookPath=str(notebook),
+        notebooks=[{"path": str(notebook)}],
+        port=received["port"],
+    )
 
-    bridge = SharedKernelBridge(root, timeout=5)
-    bridge.read_notebook("/tmp/test.nb", include_content=False, preview_chars=17)
+    bridge = SharedKernelBridge.for_file(notebook, timeout=5)
+    result = bridge.evaluate("2+3")
 
     thread.join(timeout=5)
-    assert 'BridgeReadNotebook["/tmp/test.nb"]' in received["request"]["code"]
+    assert result["resultJSON"] == 5
+    assert received["request"]["token"] == "secret"
+
+
+def test_invalid_socket_registry_records_are_stale(tmp_path, monkeypatch):
+    registry = isolate_registry(monkeypatch, tmp_path)
+    notebook = tmp_path / "demo.nb"
+    notebook.write_text("Notebook[{}]", encoding="utf-8")
+    record = write_registry_record(
+        registry,
+        notebookPath=str(notebook),
+        notebooks=[{"path": str(notebook)}],
+        host="203.0.113.10",
+    )
+
+    assert discover_bridge_records() == []
+    assert bridge_record_for_file(notebook) is None
+
+    stale = discover_bridge_records(include_stale=True, prune_stale=True)
+
+    assert len(stale) == 1
+    assert stale[0]["socket_ok"] is False
+    assert not record.exists()

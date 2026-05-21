@@ -1,23 +1,25 @@
 BeginPackage["SharedKernelMCP`"];
 
 StartSharedKernelBridge::usage =
-  "StartSharedKernelBridge[] starts a bridge inside the current notebook kernel. \
-By default it uses an authenticated localhost socket transport when available, falling back to the \
-queue-driven file transport. Commands are evaluated in this kernel, formatted cells are appended \
-to the notebook, and JSON result artifacts are written for traceability.";
+  "StartSharedKernelBridge[] starts an authenticated localhost socket bridge inside the current notebook kernel. Commands are evaluated in this kernel and notebook edits are applied through the front end.";
 
 StopSharedKernelBridge::usage =
-  "StopSharedKernelBridge[] stops the active socket listener or scheduled polling task and clears the bridge state.";
+  "StopSharedKernelBridge[] stops the active socket listener, removes its registry record, and clears the bridge state.";
 
 SharedKernelBridgeStatus::usage =
   "SharedKernelBridgeStatus[] returns an association describing the active bridge state.";
 
-ProcessSharedKernelBridgeQueue::usage =
-  "ProcessSharedKernelBridgeQueue[] processes queued command files immediately.";
+SharedKernelBridgeRegistryDirectory::usage =
+  "SharedKernelBridgeRegistryDirectory[] returns the global directory where active bridge registry records are written.";
 
-ExportNotebookSnapshot::usage =
-  "ExportNotebookSnapshot[path] writes a readable Markdown snapshot of the notebook cells, using \
-the front end when available to render cell contents as plain text.";
+SharedKernelBridgeRegistrySnapshot::usage =
+  "SharedKernelBridgeRegistrySnapshot[] writes and returns the current bridge registry record.";
+
+InstallSharedKernelMCPAutostart::usage =
+  "InstallSharedKernelMCPAutostart[] installs a quiet Kernel/init.m block that starts SharedKernelMCP automatically for front-end notebook kernels.";
+
+UninstallSharedKernelMCPAutostart::usage =
+  "UninstallSharedKernelMCPAutostart[] removes the Kernel/init.m autostart block installed by InstallSharedKernelMCPAutostart[].";
 
 BridgeRunCell::usage =
   "BridgeRunCell[path, cellID] evaluates the cell with the given integer CellID in the notebook \
@@ -58,17 +60,27 @@ Begin["`Private`"];
 
 If[! ValueQ[$BridgeState], $BridgeState = <||>];
 If[! ValueQ[$SocketBridgeBuffers], $SocketBridgeBuffers = <||>];
+If[
+  ! ValueQ[$SharedKernelMCPPacletRoot] ||
+    ! StringQ[$SharedKernelMCPPacletRoot] ||
+    $SharedKernelMCPPacletRoot === "",
+  $SharedKernelMCPPacletRoot = If[
+    StringQ[$InputFileName] && $InputFileName =!= "",
+    DirectoryName[DirectoryName[DirectoryName[$InputFileName]]],
+    ""
+  ]
+];
 
 Options[StartSharedKernelBridge] = {
-  "RootDirectory" -> Automatic,
   "Notebook" -> Automatic,
-  "Transport" -> "Auto",
   "SocketPort" -> 0,
-  "PollInterval" -> 1.0,
   "EchoInput" -> True,
   "EchoOutput" -> True,
-  "EchoPrint" -> True,
-  "SnapshotPath" -> Automatic
+  "EchoPrint" -> True
+};
+
+Options[InstallSharedKernelMCPAutostart] = {
+  "PacletDirectory" -> Automatic
 };
 
 normalizeNotebook[Automatic] :=
@@ -87,54 +99,256 @@ ensureDirectory[path_String] := Module[{},
   path
 ];
 
-defaultRootDirectory[nb_] := Module[{base, name},
-  base = Quiet @ Check[
-    If[MatchQ[nb, _NotebookObject], NotebookDirectory[nb], $Failed],
-    $Failed
+bridgeRegistryDirectoryPath[] := FileNameJoin[{
+    $UserBaseDirectory,
+    "ApplicationData",
+    "SharedKernelMCP",
+    "bridges"
+  }];
+
+bridgeRegistryDirectory[] := ensureDirectory[bridgeRegistryDirectoryPath[]];
+
+restrictRegistryPermissions[file_String] := Module[{dir = DirectoryName[file]},
+  If[$OperatingSystem =!= "Windows",
+    Quiet @ Check[RunProcess[{"chmod", "700", dir}], Null];
+    Quiet @ Check[RunProcess[{"chmod", "600", file}], Null]
   ];
-  name = Quiet @ Check[
-    If[MatchQ[nb, _NotebookObject],
-      FileNameTake[NotebookFileName[nb], -1],
-      "untitled"
-    ],
-    "untitled"
-  ];
-  If[!StringQ[name], name = "untitled"];
-  If[StringQ[base],
-    FileNameJoin[{base, ".shared_kernel_bridge", name}],
-    FileNameJoin[{Directory[], ".shared_kernel_bridge", name}]
-  ]
-];
-
-initializeDirectories[root_String] := <|
-  "Root" -> ensureDirectory[root],
-  "Queue" -> ensureDirectory[FileNameJoin[{root, "queue"}]],
-  "Processing" -> ensureDirectory[FileNameJoin[{root, "processing"}]],
-  "Done" -> ensureDirectory[FileNameJoin[{root, "done"}]],
-  "Results" -> ensureDirectory[FileNameJoin[{root, "results"}]],
-  "Logs" -> ensureDirectory[FileNameJoin[{root, "logs"}]]
-|>;
-
-kernelPIDFile[root_String] := FileNameJoin[{root, "kernel.pid"}];
-
-connectionFile[root_String] := FileNameJoin[{root, "connection.json"}];
-
-writeKernelPIDFile[root_String] := Module[{file = kernelPIDFile[root]},
-  Quiet @ Check[Export[file, ToString[$ProcessID], "Text"], $Failed];
   file
 ];
 
-removeKernelPIDFile[root_String] := Module[{file = kernelPIDFile[root]},
-  If[FileExistsQ[file], Quiet @ Check[DeleteFile[file], Null]];
+SharedKernelBridgeRegistryDirectory[] := bridgeRegistryDirectory[];
+
+bridgeRegistryFileForNotebook[nb_] := Module[{path, key, digest},
+  path = notebookPathString[nb];
+  key = If[StringQ[path] && path =!= "", path, "kernel-" <> ToString[$ProcessID]];
+  digest = IntegerString[Hash[key, "SHA256"], 16, 64];
+  FileNameJoin[{
+    bridgeRegistryDirectory[],
+    ToString[$ProcessID] <> "-" <> digest <> ".json"
+  }]
+];
+
+notebookPathString[nb_NotebookObject] := Module[{file},
+  file = Quiet @ Check[NotebookFileName[nb], ""];
+  If[StringQ[file] && file =!= "", ExpandFileName[file], ""]
+];
+
+notebookPathString[_] := "";
+
+bridgeRegistryRecord[state_Association] := Module[
+  {host, port, token, notebookPath},
+  host = Lookup[state, "SocketHost", ""];
+  port = Lookup[state, "SocketPort", Null];
+  token = Lookup[state, "SocketToken", ""];
+  notebookPath = notebookPathString[Lookup[state, "Notebook", Missing["NoNotebook"]]];
+  <|
+    "schemaVersion" -> 2,
+    "transport" -> "Socket",
+    "protocol" -> "jsonl-content-length-v1",
+    "host" -> If[StringQ[host], host, ""],
+    "port" -> If[IntegerQ[port], port, Null],
+    "token" -> If[StringQ[token], token, ""],
+    "kernelPID" -> $ProcessID,
+    "notebookPath" -> notebookPath,
+    "notebooks" -> If[notebookPath === "", {}, {<|"path" -> notebookPath|>}],
+    "createdAt" -> Lookup[state, "CreatedAt", DateString[{"ISODate", " ", "Time"}]],
+    "lastSeen" -> DateString[{"ISODate", " ", "Time"}]
+  |>
+];
+
+removeSupersededBridgeRegistryFiles[file_String, state_Association] := Module[
+  {record, pid, notebookPath, files},
+  record = bridgeRegistryRecord[state];
+  pid = Lookup[record, "kernelPID", Missing["NoPID"]];
+  notebookPath = Lookup[record, "notebookPath", ""];
+  files = DeleteCases[FileNames["*.json", DirectoryName[file]], file];
+  Scan[
+    Function[otherFile,
+      Module[{other = Quiet @ Check[Import[otherFile, "RawJSON"], $Failed]},
+        If[
+          AssociationQ[other] &&
+            Lookup[other, "kernelPID", Missing["NoPID"]] === pid &&
+            Lookup[other, "notebookPath", ""] === notebookPath,
+          Quiet @ Check[DeleteFile[otherFile], Null]
+        ]
+      ]
+    ],
+    files
+  ];
   Null
 ];
 
-removeConnectionFile[root_String] := Module[{file = connectionFile[root]},
-  If[FileExistsQ[file], Quiet @ Check[DeleteFile[file], Null]];
+writeBridgeRegistryFile[state_Association] := Module[{file},
+  file = Lookup[state, "RegistryFile", Automatic];
+  If[! StringQ[file], file = bridgeRegistryFileForNotebook[Lookup[state, "Notebook", Missing["NoNotebook"]]]];
+  removeSupersededBridgeRegistryFiles[file, state];
+  Quiet @ Check[
+    Export[file, bridgeRegistryRecord[state], "RawJSON"],
+    Return[$Failed]
+  ];
+  restrictRegistryPermissions[file]
+];
+
+refreshBridgeRegistry[] := Module[{file},
+  If[
+    ! AssociationQ[$BridgeState] ||
+      ! MatchQ[Lookup[$BridgeState, "SocketListener", Missing["NoSocketListener"]], _SocketListener] ||
+      ! KeyExistsQ[$BridgeState, "SocketToken"],
+    Return[$Failed]
+  ];
+  file = writeBridgeRegistryFile[$BridgeState];
+  If[StringQ[file], $BridgeState["RegistryFile"] = file];
+  file
+];
+
+removeBridgeRegistryFile[file_] := Module[{},
+  If[StringQ[file] && FileExistsQ[file],
+    Quiet @ Check[DeleteFile[file], Null]
+  ];
   Null
+];
+
+autostartBeginMarker = "(* BEGIN SharedKernelMCP autostart *)";
+autostartEndMarker = "(* END SharedKernelMCP autostart *)";
+
+kernelInitFile[] := FileNameJoin[{$UserBaseDirectory, "Kernel", "init.m"}];
+
+resolveAutostartPacletDirectory[Automatic] := If[
+  StringQ[$SharedKernelMCPPacletRoot] && $SharedKernelMCPPacletRoot =!= "",
+  $SharedKernelMCPPacletRoot,
+  None
+];
+
+resolveAutostartPacletDirectory[path_String] := ExpandFileName[path];
+resolveAutostartPacletDirectory[None] := None;
+resolveAutostartPacletDirectory[_] := None;
+
+stripAutostartBlock[text_String] := FixedPoint[
+  Function[s,
+    Module[{start, stop},
+      start = StringPosition[s, autostartBeginMarker];
+      If[start === {},
+        s,
+        stop = Select[
+          StringPosition[s, autostartEndMarker],
+          #[[1]] > start[[1, 1]] &
+        ];
+        If[stop === {},
+          s,
+          StringTake[s, start[[1, 1]] - 1] <> StringDrop[s, stop[[1, 2]]]
+        ]
+      ]
+    ]
+  ],
+  text
+];
+
+autostartBlock[pacletDir_] := Module[
+  {loadLine},
+  loadLine = If[StringQ[pacletDir],
+    "  Quiet @ Check[PacletDirectoryLoad[" <> ToString[pacletDir, InputForm] <> "], Null];\n",
+    ""
+  ];
+  StringJoin[
+    autostartBeginMarker, "\n",
+    "Quiet @ Check[\n",
+    " Module[{},\n",
+    loadLine,
+    "  Needs[\"SharedKernelMCP`\"];\n",
+    "  If[$FrontEnd =!= Null && OwnValues[$Pre] === {} && ! TrueQ[SharedKernelMCP`Private`$AutostartPreInstalled],\n",
+    "    SharedKernelMCP`Private`$AutostartPreInstalled = True;\n",
+    "    $Pre = Function[expr,\n",
+    "      Quiet @ Check[\n",
+    "        If[! TrueQ[SharedKernelMCP`Private`$AutostartBridgeStarted],\n",
+    "          Module[{nb = Quiet @ Check[EvaluationNotebook[], $Failed]},\n",
+    "            If[MatchQ[nb, _NotebookObject],\n",
+    "              SharedKernelMCP`Private`$AutostartBridgeStarted = True;\n",
+    "              SharedKernelMCP`StartSharedKernelBridge[\"Notebook\" -> nb];\n",
+    "            ];\n",
+    "          ];\n",
+    "        ],\n",
+    "        Null\n",
+    "      ];\n",
+    "      expr\n",
+    "    ];\n",
+    "  ];\n",
+    " ],\n",
+    " Null\n",
+    "];\n",
+    autostartEndMarker
+  ]
 ];
 
 stringify[expr_] := ToString[Unevaluated[expr], InputForm, PageWidth -> Infinity];
+
+$ResultInputFormMaxChars = 50000;
+$ResultJSONMaxChars = 200000;
+$MessagePrintMaxChars = 1000;
+$CodeEchoMaxChars = 1000;
+
+truncateBridgeString[text_String, maxChars_Integer:$MessagePrintMaxChars] := Module[{chars},
+  chars = StringLength[text];
+  If[chars > maxChars,
+    StringTake[text, maxChars] <> "... [truncated " <> ToString[chars - maxChars] <> " chars]",
+    text
+  ]
+];
+
+bridgeStringListFields[key_String, values_List] := Module[{texts, chars},
+  texts = ToString /@ values;
+  chars = StringLength /@ texts;
+  <|
+    key -> (truncateBridgeString /@ texts),
+    key <> "Truncated" -> AnyTrue[chars, # > $MessagePrintMaxChars &],
+    key <> "Chars" -> chars
+  |>
+];
+
+bridgeCodeFields[code_String] := Module[{chars},
+  chars = StringLength[code];
+  <|
+    "code" -> truncateBridgeString[code, $CodeEchoMaxChars],
+    "codeTruncated" -> TrueQ[chars > $CodeEchoMaxChars],
+    "codeChars" -> chars
+  |>
+];
+
+resultInputFormFields[result_] := Module[{text, chars, maxChars},
+  text = stringify[result];
+  chars = StringLength[text];
+  maxChars = $ResultInputFormMaxChars;
+  <|
+    "resultInputForm" -> If[chars > maxChars,
+      StringTake[text, maxChars] <> "... [truncated " <> ToString[chars - maxChars] <> " chars]",
+      text
+    ],
+    "resultInputFormTruncated" -> TrueQ[chars > maxChars],
+    "resultInputFormChars" -> chars
+  |>
+];
+
+fullResultJSONRequestedQ[code_String] := StringContainsQ[code, "(*FULLJSON*)"];
+
+resultJSONFields[code_String, result_] := Module[{json, chars, full},
+  json = Quiet @ Check[ExportString[result, "RawJSON"], $Failed];
+  If[! StringQ[json],
+    Return[<|"resultJSON" -> Null, "resultJSONTruncated" -> False|>]
+  ];
+  chars = StringLength[json];
+  full = fullResultJSONRequestedQ[code];
+  If[full || chars <= $ResultJSONMaxChars,
+    <|
+      "resultJSON" -> Quiet @ Check[ImportString[json, "RawJSON"], Null],
+      "resultJSONTruncated" -> False,
+      "resultJSONChars" -> chars
+    |>,
+    <|
+      "resultJSON" -> Null,
+      "resultJSONTruncated" -> True,
+      "resultJSONChars" -> chars
+    |>
+  ]
+];
 
 appendNotebookCell[nb_, cell_Cell] := Module[{},
   If[$FrontEnd === Null || ! MatchQ[nb, _NotebookObject],
@@ -186,112 +400,21 @@ withNotebookViewPreserved[nb_, expr_] := Module[
   result
 ];
 
-cellStyle[cell_Cell] := Replace[cell, Cell[_, style_String, ___] :> style, {0}];
-
-cellPlainText[cell_Cell] := Module[{rendered},
-  rendered = Quiet @ Check[
-    FrontEndExecute[ExportPacket[cell, "PlainText"]],
-    $Failed
-  ];
-  Which[
-    StringQ[rendered], rendered,
-    ListQ[rendered] && Length[rendered] >= 1 && StringQ[First[rendered]], First[rendered],
-    True, stringify[cell]
-  ]
+bridgeResultAssociation[id_String, code_String, status_String, result_, messages_List, prints_List, duration_] := Join[
+  <|
+    "id" -> id,
+    "timestamp" -> DateString[{"ISODate", " ", "Time"}],
+    "status" -> status
+  |>,
+  bridgeCodeFields[code],
+  resultInputFormFields[result],
+  resultJSONFields[code, result],
+  bridgeStringListFields["messages", messages],
+  bridgeStringListFields["prints", prints],
+  <|"durationSeconds" -> N[duration, 6]|>
 ];
 
-ExportNotebookSnapshot[path_: Automatic, notebook_: Automatic] := Module[
-  {nb, dest, cells, sections, style, text},
-  nb = normalizeNotebook[notebook];
-  If[! MatchQ[nb, _NotebookObject],
-    Return[$Failed]
-  ];
-
-  dest = Replace[path, Automatic :>
-    If[AssociationQ[$BridgeState] && KeyExistsQ[$BridgeState, "Directories"],
-      FileNameJoin[{$BridgeState["Directories"]["Root"], "notebook_snapshot.md"}],
-      FileNameJoin[{Directory[], "notebook_snapshot.md"}]
-    ]
-  ];
-
-  cells = Quiet @ Check[NotebookRead /@ Cells[nb], $Failed];
-  If[cells === $Failed,
-    Return[$Failed]
-  ];
-
-  sections = Map[
-    Function[cell,
-      style = Replace[cellStyle[cell], Except[_String] -> "Cell"];
-      text = StringTrim[cellPlainText[cell]];
-      StringRiffle[
-        {
-          "## " <> style,
-          "",
-          "```text",
-          text,
-          "```"
-        },
-        "\n"
-      ]
-    ],
-    cells
-  ];
-
-  Export[dest, StringRiffle[sections, "\n\n"], "Text"];
-  dest
-];
-
-bridgeResultAssociation[id_String, code_String, status_String, result_, messages_List, prints_List, duration_] := <|
-  "id" -> id,
-  "timestamp" -> DateString[{"ISODate", " ", "Time"}],
-  "status" -> status,
-  "code" -> code,
-  "resultInputForm" -> stringify[result],
-  "resultJSON" -> Quiet @ Check[
-    ImportString[ExportString[result, "RawJSON"], "RawJSON"],
-    Null
-  ],
-  "messages" -> messages,
-  "prints" -> prints,
-  "durationSeconds" -> N[duration, 6]
-|>;
-
-bridgeCommandLogText[result_Association] := Module[
-  {
-    status = Lookup[result, "status", "unknown"],
-    duration = Lookup[result, "durationSeconds", 0.],
-    messages = Lookup[result, "messages", {}],
-    prints = Lookup[result, "prints", {}],
-    resultInputForm = Lookup[result, "resultInputForm", ""]
-  },
-  StringRiffle[
-    {
-      "status: " <> ToString[status],
-      "durationSeconds: " <> ToString @ N[duration, 6],
-      "messages:",
-      If[messages === {}, "(none)", StringRiffle[messages, "\n"]],
-      "prints:",
-      If[prints === {}, "(none)", StringRiffle[prints, "\n"]],
-      "resultInputForm:",
-      resultInputForm
-    },
-    "\n\n"
-  ]
-];
-
-writeBridgeCommandArtifacts[id_String, state_Association, result_Association] := Module[
-  {resultFile, logFile, dirs = Lookup[state, "Directories", <||>]},
-  If[! AssociationQ[dirs] || ! KeyExistsQ[dirs, "Results"] || ! KeyExistsQ[dirs, "Logs"],
-    Return[Null]
-  ];
-  resultFile = FileNameJoin[{dirs["Results"], id <> ".json"}];
-  logFile = FileNameJoin[{dirs["Logs"], id <> ".log"}];
-  Quiet @ Check[Export[resultFile, result, "JSON"], Null];
-  Quiet @ Check[Export[logFile, bridgeCommandLogText[result], "Text"], Null];
-  Null
-];
-
-evaluateBridgeCommand[queueId_String, code_String, state_Association] := Module[
+evaluateBridgeCommand[commandId_String, code_String, state_Association] := Module[
   {
     held,
     result = Null,
@@ -335,9 +458,9 @@ evaluateBridgeCommand[queueId_String, code_String, state_Association] := Module[
     status = "parse_error";
     messages = parseMessages;
     If[!silent,
-      appendTextCell[nb, "Bridge parse error in queued command " <> queueId <> ".", "Message"]
+      appendTextCell[nb, "Bridge parse error in command " <> commandId <> ".", "Message"]
     ];
-    Return[bridgeResultAssociation[queueId, code, status, $Failed, messages, prints, 0.]]
+    Return[bridgeResultAssociation[commandId, code, status, $Failed, messages, prints, 0.]]
   ];
 
   If[!silent && TrueQ[state["EchoInput"]],
@@ -359,6 +482,7 @@ evaluateBridgeCommand[queueId_String, code_String, state_Association] := Module[
         $Context = "Global`",
         $ContextPath = DeleteDuplicates @ Join[{"System`", "Global`"}, $ContextPath],
         $MessageList = {},
+        $Messages = If[silent, {}, $Messages],
         Print = printFunction
       },
       With[{evaluated = If[
@@ -387,43 +511,7 @@ evaluateBridgeCommand[queueId_String, code_String, state_Association] := Module[
     appendOutputCell[nb, result]
   ];
 
-  If[StringQ[state["SnapshotPath"]],
-    Quiet @ Check[ExportNotebookSnapshot[state["SnapshotPath"], nb], Null]
-  ];
-
-  bridgeResultAssociation[queueId, code, status, result, messages, prints, duration]
-];
-
-processCommandFile[file_String, state_Association] := Module[
-  {
-    queueName,
-    queueId,
-    processingFile,
-    doneFile,
-    result,
-    code
-  },
-
-  queueName = FileNameTake[file];
-  queueId = FileBaseName[file];
-  processingFile = FileNameJoin[{state["Directories"]["Processing"], queueName}];
-  doneFile = FileNameJoin[{state["Directories"]["Done"], queueName}];
-
-  Quiet @ Check[
-    RenameFile[file, processingFile, OverwriteTarget -> True],
-    Return[$Failed]
-  ];
-
-  code = Quiet @ Check[Import[processingFile, "Text", CharacterEncoding -> "UTF8"], $Failed];
-  If[! StringQ[code],
-    result = bridgeResultAssociation[queueId, "", "read_error", $Failed, {}, {}, 0.],
-    result = evaluateBridgeCommand[queueId, code, state]
-  ];
-
-  writeBridgeCommandArtifacts[queueId, state, result];
-
-  RenameFile[processingFile, doneFile, OverwriteTarget -> True];
-  Lookup[result, "status", "unknown"]
+  bridgeResultAssociation[commandId, code, status, result, messages, prints, duration]
 ];
 
 socketBridgeToken[] := StringReplace[CreateUUID[], "-" -> ""];
@@ -435,24 +523,6 @@ socketListenerPort[listener_] := Module[{socket, port},
   If[IntegerQ[port], Return[port]];
   port = Quiet @ Check[socket["SourcePort"], $Failed];
   If[IntegerQ[port], port, $Failed]
-];
-
-writeSocketConnectionFile[root_String, host_String, port_Integer, token_String] := Module[
-  {file = connectionFile[root]},
-  Export[
-    file,
-    <|
-      "transport" -> "socket",
-      "protocol" -> "jsonl-content-length-v1",
-      "host" -> host,
-      "port" -> port,
-      "token" -> token,
-      "kernelPID" -> $ProcessID,
-      "createdAt" -> DateString[{"ISODate", " ", "Time"}]
-    |>,
-    "RawJSON"
-  ];
-  file
 ];
 
 socketErrorResponse[id_, status_String, message_String] := <|
@@ -532,13 +602,14 @@ handleSocketBridgeEvent[event_Association] := Module[
         code = Lookup[request, "code", $Failed];
         If[! StringQ[code],
           socketErrorResponse[id, "bad_request", "Request did not include a string code field."],
-          result = evaluateBridgeCommand[id, code, state];
-          writeBridgeCommandArtifacts[id, state, result];
-          result
+          evaluateBridgeCommand[id, code, state]
         ]
       ]
   ];
 
+  If[AssociationQ[state] && KeyExistsQ[state, "SocketToken"],
+    Quiet @ Check[refreshBridgeRegistry[], Null]
+  ];
   response = Quiet @ Check[ExportString[result, "RawJSON"], "{\"status\":\"encode_error\"}"];
   If[MatchQ[source, _SocketObject],
     socketWriteResponse[source, response]
@@ -590,22 +661,54 @@ cellStyleOf[cellExpr_] := Replace[
   HoldPattern[Cell[_, style_String, ___]] :> style
 ];
 
-cellIDOf[cellExpr_] := Module[{ids},
-  ids = Cases[cellExpr, HoldPattern[CellID -> v_Integer] :> v, Infinity];
-  If[ids === {}, Missing["NoID"], First[ids]]
+cellIDOf[cell_Cell] := Module[{ids},
+  ids = Cases[Rest[List @@ cell], HoldPattern[CellID -> v_Integer] :> v, {1}];
+  If[ids === {}, Missing["NoID"], Last[ids]]
+];
+
+cellIDOf[_] := Missing["NoID"];
+
+cellWithCellID[cell_Cell, id_Integer] := Module[{parts},
+  parts = List @@ cell;
+  Apply[
+    Cell,
+    Join[
+      {First[parts]},
+      DeleteCases[Rest[parts], HoldPattern[CellID -> _], {1}],
+      {CellID -> id}
+    ]
+  ]
+];
+
+cellWithCellID[other_, _Integer] := other;
+
+cellIDsInNotebook[nb_NotebookObject] := DeleteMissing[
+  cellIDOf /@ (Quiet @ Check[NotebookRead /@ Cells[nb], {}])
+];
+
+nextFreeCellIDFromUsed[used_Association, start_Integer] := Module[
+  {candidate = Max[1, start]},
+  While[KeyExistsQ[used, candidate], candidate++];
+  candidate
 ];
 
 nextFreeCellID[nb_NotebookObject] := Module[{ids},
-  ids = Cases[
-    NotebookRead /@ Cells[nb],
-    HoldPattern[CellID -> v_Integer] :> v,
-    Infinity
-  ];
+  ids = cellIDsInNotebook[nb];
   If[ids === {}, 1, Max[ids] + 1]
 ];
 
-assignCellIDsToNotebook[nb_NotebookObject] := Module[
-  {currentCells, nextId, finalCells, savedSel, savedScroll, didWrite = False},
+normalizeCellIDsInNotebook[nb_NotebookObject] := Module[
+  {
+    currentCells,
+    nextId,
+    finalCells,
+    savedSel,
+    savedScroll,
+    didWrite = False,
+    used = <||>,
+    assigned = {},
+    remapped = {}
+  },
   savedSel = Quiet @ Check[SelectedCells[nb], {}];
   savedScroll = Quiet @ Check[
     CurrentValue[nb, "WindowScrollPosition"],
@@ -614,14 +717,24 @@ assignCellIDsToNotebook[nb_NotebookObject] := Module[
   currentCells = Cells[nb];
   nextId = nextFreeCellID[nb];
   Do[
-    Module[{cellObj, cellExpr, existing},
+    Module[{cellObj, cellExpr, existing, newId},
       cellObj = currentCells[[i]];
       cellExpr = NotebookRead[cellObj];
       existing = cellIDOf[cellExpr];
-      If[MissingQ[existing],
-        NotebookWrite[cellObj, Append[cellExpr, CellID -> nextId]];
-        nextId++;
-        didWrite = True
+      If[MissingQ[existing] || KeyExistsQ[used, existing],
+        newId = nextFreeCellIDFromUsed[used, nextId];
+        NotebookWrite[cellObj, cellWithCellID[cellExpr, newId]];
+        If[MissingQ[existing],
+          AppendTo[assigned, <|"index" -> i, "newCellID" -> newId|>],
+          AppendTo[
+            remapped,
+            <|"index" -> i, "oldCellID" -> existing, "newCellID" -> newId|>
+          ]
+        ];
+        used[newId] = True;
+        nextId = newId + 1;
+        didWrite = True,
+        used[existing] = True
       ]
     ],
     {i, Length[currentCells]}
@@ -639,23 +752,63 @@ assignCellIDsToNotebook[nb_NotebookObject] := Module[
       Quiet @ Check[SetOptions[nb, WindowScrollPosition -> savedScroll], Null]
     ]
   ];
-  MapIndexed[
-    Module[{cellExpr, id},
-      cellExpr = NotebookRead[#1];
-      id = cellIDOf[cellExpr];
-      <|"index" -> First[#2], "cellID" -> id, "cellObject" -> #1|>
-    ] &,
-    finalCells
+  <|
+    "cells" -> MapIndexed[
+      Module[{cellExpr, id},
+        cellExpr = NotebookRead[#1];
+        id = cellIDOf[cellExpr];
+        <|"index" -> First[#2], "cellID" -> id, "cellObject" -> #1|>
+      ] &,
+      finalCells
+    ],
+    "assigned" -> assigned,
+    "remapped" -> remapped
+  |>
+];
+
+assignCellIDsToNotebook[nb_NotebookObject] := Lookup[
+  normalizeCellIDsInNotebook[nb],
+  "cells",
+  {}
+];
+
+findCellObjectsByID[nb_NotebookObject, cellID_Integer] := Select[
+  Cells[nb],
+  cellIDOf[NotebookRead[#]] === cellID &
+];
+
+findCellByID[nb_NotebookObject, cellID_Integer] := Module[{matches},
+  matches = findCellObjectsByID[nb, cellID];
+  Which[
+    Length[matches] === 1, First[matches],
+    Length[matches] === 0, Missing["NotFound"],
+    True, Missing["DuplicateCellID"]
   ]
 ];
 
-findCellByID[nb_NotebookObject, cellID_Integer] := SelectFirst[
-  Cells[nb],
-  Module[{ids},
-    ids = Cases[NotebookRead[#], HoldPattern[CellID -> v_Integer] :> v, Infinity];
-    MemberQ[ids, cellID]
-  ] &,
-  Missing["NotFound"]
+ambiguousCellIDResponse[cellID_Integer, remapped_: {}] := <|
+  "status" -> "cell_id_ambiguous",
+  "cellID" -> cellID,
+  "remapped" -> remapped,
+  "message" -> "CellID was duplicated and has been repaired; re-read the notebook and retry with the current CellID."
+|>;
+
+cellIDTargetAfterNormalization[nb_NotebookObject, cellID_Integer] := Module[
+  {normalization, remapped, target},
+  normalization = normalizeCellIDsInNotebook[nb];
+  remapped = Select[
+    Lookup[normalization, "remapped", {}],
+    Lookup[#, "oldCellID", Missing["NoID"]] === cellID &
+  ];
+  If[remapped =!= {},
+    Return[ambiguousCellIDResponse[cellID, remapped]]
+  ];
+  target = findCellByID[nb, cellID];
+  Which[
+    MatchQ[target, _CellObject], target,
+    target === Missing["DuplicateCellID"], ambiguousCellIDResponse[cellID],
+    True, <|"status" -> "cell_id_not_found", "cellID" -> cellID|>
+  ]
 ];
 
 bridgeOutputTagFor[cellID_Integer] :=
@@ -675,7 +828,7 @@ findExistingOutputCell[nb_NotebookObject, tag_String] := SelectFirst[
 ];
 
 BridgeReadNotebook[path_String, includeContent_: True, previewChars_: 80] := Module[
-  {nb, mapping, include = TrueQ[includeContent], maxPreview},
+  {nb, normalization, mapping, include = TrueQ[includeContent], maxPreview},
   maxPreview = Replace[previewChars, (n_Integer /; n > 0) :> n, {0}];
   If[! IntegerQ[maxPreview], maxPreview = 80];
   nb = findNotebookByPath[path];
@@ -683,10 +836,13 @@ BridgeReadNotebook[path_String, includeContent_: True, previewChars_: 80] := Mod
     Return[<|"status" -> "notebook_not_open", "path" -> path|>]
   ];
   withNotebookViewPreserved[nb,
-    mapping = assignCellIDsToNotebook[nb];
+    normalization = normalizeCellIDsInNotebook[nb];
+    mapping = Lookup[normalization, "cells", {}];
     <|
       "status" -> "ok",
       "path" -> path,
+      "cellIDAssigned" -> Lookup[normalization, "assigned", {}],
+      "cellIDRemapped" -> Lookup[normalization, "remapped", {}],
       "cells" -> Map[
         Module[{cellObj, cellExpr, style, content},
           cellObj = #["cellObject"];
@@ -739,13 +895,8 @@ BridgeRunCell[path_String, cellID_Integer, evalTimeout_:Null] := Module[
     Return[<|"status" -> "notebook_not_open", "path" -> path|>]
   ];
 
-  target = findCellByID[nb, cellID];
-  If[! MatchQ[target, _CellObject],
-    Return[<|
-      "status" -> "cell_id_not_found",
-      "cellID" -> cellID
-    |>]
-  ];
+  target = cellIDTargetAfterNormalization[nb, cellID];
+  If[! MatchQ[target, _CellObject], Return[target]];
 
   content = cellInputCode[target];
 
@@ -834,14 +985,18 @@ BridgeRunCell[path_String, cellID_Integer, evalTimeout_:Null] := Module[
     ]
   ];
 
-  <|
-    "status" -> status,
-    "cellID" -> cellID,
-    "resultInputForm" -> stringify[result],
-    "messages" -> messages,
-    "prints" -> prints,
-    "durationSeconds" -> N[duration, 6]
-  |>
+  Join[
+    <|
+      "status" -> status,
+      "cellID" -> cellID,
+      "inNumber" -> lineNum,
+      "outNumber" -> lineNum
+    |>,
+    resultInputFormFields[result],
+    bridgeStringListFields["messages", messages],
+    bridgeStringListFields["prints", prints],
+    <|"durationSeconds" -> N[duration, 6]|>
+  ]
 ];
 
 BridgeUpdateCell[path_String, cellID_Integer, cellType_String, content_String] := Module[
@@ -850,13 +1005,8 @@ BridgeUpdateCell[path_String, cellID_Integer, cellType_String, content_String] :
   If[! MatchQ[nb, _NotebookObject],
     Return[<|"status" -> "notebook_not_open", "path" -> path|>]
   ];
-  target = findCellByID[nb, cellID];
-  If[! MatchQ[target, _CellObject],
-    Return[<|
-      "status" -> "cell_id_not_found",
-      "cellID" -> cellID
-    |>]
-  ];
+  target = cellIDTargetAfterNormalization[nb, cellID];
+  If[! MatchQ[target, _CellObject], Return[target]];
   replacement = Cell[content, cellType, CellID -> cellID];
   withNotebookViewPreserved[nb, NotebookWrite[target, replacement]];
   <|
@@ -874,10 +1024,8 @@ bridgeInsertCellAt[
   If[! MatchQ[nb, _NotebookObject],
     Return[<|"status" -> "notebook_not_open", "path" -> path|>]
   ];
-  anchor = findCellByID[nb, cellID];
-  If[! MatchQ[anchor, _CellObject],
-    Return[<|"status" -> "cell_id_not_found", "cellID" -> cellID|>]
-  ];
+  anchor = cellIDTargetAfterNormalization[nb, cellID];
+  If[! MatchQ[anchor, _CellObject], Return[anchor]];
   newId = nextFreeCellID[nb];
   newCell = Cell[content, cellType, CellID -> newId];
   withNotebookViewPreserved[nb,
@@ -904,10 +1052,8 @@ BridgeDeleteCell[path_String, cellID_Integer] := Module[
   If[! MatchQ[nb, _NotebookObject],
     Return[<|"status" -> "notebook_not_open", "path" -> path|>]
   ];
-  target = findCellByID[nb, cellID];
-  If[! MatchQ[target, _CellObject],
-    Return[<|"status" -> "cell_id_not_found", "cellID" -> cellID|>]
-  ];
+  target = cellIDTargetAfterNormalization[nb, cellID];
+  If[! MatchQ[target, _CellObject], Return[target]];
   outputTag = bridgeOutputTagFor[cellID];
   existingOutput = findExistingOutputCell[nb, outputTag];
   withNotebookViewPreserved[nb,
@@ -942,11 +1088,7 @@ BridgeSweepStaleOutputs[path_String] := Module[
     Return[<|"status" -> "notebook_not_open", "path" -> path|>]
   ];
   allCells = Cells[nb];
-  allCellIDs = Cases[
-    NotebookRead /@ allCells,
-    HoldPattern[CellID -> v_Integer] :> v,
-    Infinity
-  ];
+  allCellIDs = DeleteMissing[cellIDOf /@ (NotebookRead /@ allCells)];
   Do[
     Module[{cellExpr, tags, bridgeTags, parents, hasValidParent, doomed},
       cellExpr = NotebookRead[cellObj];
@@ -969,30 +1111,80 @@ BridgeSweepStaleOutputs[path_String] := Module[
   |>
 ];
 
-ProcessSharedKernelBridgeQueue[] := Module[{state, files},
-  state = $BridgeState;
-  If[! AssociationQ[state] || ! KeyExistsQ[state, "Directories"],
-    Return[0]
+SharedKernelBridgeRegistrySnapshot[] := Module[{file, record},
+  file = refreshBridgeRegistry[];
+  If[! StringQ[file],
+    Return[<|"status" -> "not_running"|>]
   ];
-  files = Sort @ FileNames["*.wl", state["Directories"]["Queue"]];
-  Scan[processCommandFile[#, state] &, files];
-  Length[files]
+  record = bridgeRegistryRecord[$BridgeState];
+  Join[
+    record,
+    <|
+      "status" -> "ok",
+      "registryDirectory" -> bridgeRegistryDirectory[],
+      "registryFile" -> file
+    |>
+  ]
+];
+
+InstallSharedKernelMCPAutostart[OptionsPattern[]] := Module[
+  {pacletDir, file, existing, cleaned, block},
+  pacletDir = resolveAutostartPacletDirectory[OptionValue["PacletDirectory"]];
+  file = kernelInitFile[];
+  ensureDirectory[DirectoryName[file]];
+  existing = If[FileExistsQ[file], Quiet @ Check[Import[file, "Text"], ""], ""];
+  cleaned = stripAutostartBlock[existing];
+  block = autostartBlock[pacletDir];
+  Quiet @ Check[
+    Export[
+      file,
+      If[StringTrim[cleaned] === "",
+        block <> "
+",
+        StringTrim[cleaned] <> "
+
+" <> block <> "
+"
+      ],
+      "Text"
+    ],
+    Return[<|"status" -> "error", "message" -> "Could not write Kernel/init.m."|>]
+  ];
+  <|
+    "status" -> "ok",
+    "file" -> file,
+    "pacletDirectory" -> pacletDir
+  |>
+];
+
+UninstallSharedKernelMCPAutostart[] := Module[{file, existing, cleaned},
+  file = kernelInitFile[];
+  If[! FileExistsQ[file],
+    Return[<|"status" -> "not_installed", "file" -> file|>]
+  ];
+  existing = Quiet @ Check[Import[file, "Text"], ""];
+  cleaned = stripAutostartBlock[existing];
+  If[cleaned === existing,
+    Return[<|"status" -> "not_installed", "file" -> file|>]
+  ];
+  Quiet @ Check[
+    Export[
+      file,
+      If[StringTrim[cleaned] === "", "", StringTrim[cleaned] <> "\n"],
+      "Text"
+    ],
+    Return[<|"status" -> "error", "message" -> "Could not write Kernel/init.m."|>]
+  ];
+  <|"status" -> "ok", "file" -> file|>
 ];
 
 StopSharedKernelBridge[] := Module[
-  {task = Lookup[$BridgeState, "Task", Missing["NoTask"]],
-   listener = Lookup[$BridgeState, "SocketListener", Missing["NoSocketListener"]],
-   dirs = Lookup[$BridgeState, "Directories", <||>]},
-  If[MatchQ[task, _ScheduledTaskObject],
-    Quiet @ Check[RemoveScheduledTask[task], Null]
-  ];
+  {listener = Lookup[$BridgeState, "SocketListener", Missing["NoSocketListener"]],
+   registryFile = Lookup[$BridgeState, "RegistryFile", Automatic]},
   If[MatchQ[listener, _SocketListener],
     Quiet @ Check[DeleteObject[listener], Null]
   ];
-  If[AssociationQ[dirs] && KeyExistsQ[dirs, "Root"],
-    removeKernelPIDFile[dirs["Root"]];
-    removeConnectionFile[dirs["Root"]]
-  ];
+  removeBridgeRegistryFile[registryFile];
   $BridgeState = <||>;
   Null
 ];
@@ -1000,73 +1192,21 @@ StopSharedKernelBridge[] := Module[
 StartSharedKernelBridge[OptionsPattern[]] := Module[
   {
     nb,
-    root,
-    dirs,
-    snapshotPath,
-    task = Missing["NoTask"],
     status,
-    requestedTransport,
     listener = Missing["NoSocketListener"],
     token,
     port
   },
   StopSharedKernelBridge[];
 
-  requestedTransport = ToLowerCase @ ToString[OptionValue["Transport"]];
-  If[! MemberQ[{"auto", "socket", "file"}, requestedTransport],
-    Return[<|
-      "Running" -> False,
-      "status" -> "invalid_transport",
-      "message" -> "Transport must be \"Auto\", \"Socket\", or \"File\"."
-    |>]
-  ];
-
   nb = normalizeNotebook[OptionValue["Notebook"]];
-  root = Replace[OptionValue["RootDirectory"], Automatic :> defaultRootDirectory[nb]];
-  dirs = initializeDirectories[root];
-  snapshotPath = Replace[
-    OptionValue["SnapshotPath"],
-    Automatic :> FileNameJoin[{dirs["Root"], "notebook_snapshot.md"}]
+  token = socketBridgeToken[];
+  listener = Quiet @ Check[
+    startSocketTransport[OptionValue["SocketPort"], token],
+    Missing["SocketListenFailed"]
   ];
 
-  $BridgeState = <|
-    "Notebook" -> nb,
-    "Directories" -> dirs,
-    "Transport" -> "Starting",
-    "PollInterval" -> OptionValue["PollInterval"],
-    "EchoInput" -> TrueQ[OptionValue["EchoInput"]],
-    "EchoOutput" -> TrueQ[OptionValue["EchoOutput"]],
-    "EchoPrint" -> TrueQ[OptionValue["EchoPrint"]],
-    "SnapshotPath" -> snapshotPath,
-    "KernelPID" -> $ProcessID
-  |>;
-
-  writeKernelPIDFile[dirs["Root"]];
-
-  If[MemberQ[{"auto", "socket"}, requestedTransport],
-    token = socketBridgeToken[];
-    listener = Quiet @ Check[
-      startSocketTransport[OptionValue["SocketPort"], token],
-      Missing["SocketListenFailed"]
-    ];
-    If[MatchQ[listener, _SocketListener],
-      port = socketListenerPort[listener];
-      If[IntegerQ[port],
-        $BridgeState["Transport"] = "Socket";
-        $BridgeState["SocketListener"] = listener;
-        $BridgeState["SocketToken"] = token;
-        $BridgeState["SocketHost"] = "127.0.0.1";
-        $BridgeState["SocketPort"] = port;
-        writeSocketConnectionFile[dirs["Root"], "127.0.0.1", port, token],
-        Quiet @ Check[DeleteObject[listener], Null];
-        listener = Missing["SocketPortUnavailable"]
-      ]
-    ]
-  ];
-
-  If[requestedTransport === "socket" && ! MatchQ[listener, _SocketListener],
-    removeKernelPIDFile[dirs["Root"]];
-    removeConnectionFile[dirs["Root"]];
+  If[! MatchQ[listener, _SocketListener],
     $BridgeState = <||>;
     Return[<|
       "Running" -> False,
@@ -1075,37 +1215,48 @@ StartSharedKernelBridge[OptionsPattern[]] := Module[
     |>]
   ];
 
-  If[! MatchQ[listener, _SocketListener],
-    task = RunScheduledTask[ProcessSharedKernelBridgeQueue[], OptionValue["PollInterval"]];
-    $BridgeState["Task"] = task;
-    $BridgeState["Transport"] = "File";
-    removeConnectionFile[dirs["Root"]]
+  port = socketListenerPort[listener];
+  If[! IntegerQ[port],
+    Quiet @ Check[DeleteObject[listener], Null];
+    $BridgeState = <||>;
+    Return[<|
+      "Running" -> False,
+      "status" -> "socket_port_unavailable",
+      "message" -> "Could not determine SocketListen port."
+    |>]
   ];
 
+  $BridgeState = <|
+    "Notebook" -> nb,
+    "Transport" -> "Socket",
+    "SocketListener" -> listener,
+    "SocketToken" -> token,
+    "SocketHost" -> "127.0.0.1",
+    "SocketPort" -> port,
+    "EchoInput" -> TrueQ[OptionValue["EchoInput"]],
+    "EchoOutput" -> TrueQ[OptionValue["EchoOutput"]],
+    "EchoPrint" -> TrueQ[OptionValue["EchoPrint"]],
+    "KernelPID" -> $ProcessID,
+    "CreatedAt" -> DateString[{"ISODate", " ", "Time"}]
+  |>;
+
   status = SharedKernelBridgeStatus[];
-  Quiet @ Check[ExportNotebookSnapshot[snapshotPath, nb], Null];
   status
 ];
 
-SharedKernelBridgeStatus[] := <|
-  "Running" -> (
-    MatchQ[Lookup[$BridgeState, "Task", Missing["NoTask"]], _ScheduledTaskObject] ||
-    MatchQ[Lookup[$BridgeState, "SocketListener", Missing["NoSocketListener"]], _SocketListener]
-  ),
-  "Transport" -> Lookup[$BridgeState, "Transport", Missing["NoTransport"]],
-  "NotebookAttached" -> MatchQ[Lookup[$BridgeState, "Notebook", Missing["NoNotebook"]], _NotebookObject],
-  "QueueDirectory" -> Lookup[Lookup[$BridgeState, "Directories", <||>], "Queue", Missing["NoQueue"]],
-  "ResultsDirectory" -> Lookup[Lookup[$BridgeState, "Directories", <||>], "Results", Missing["NoResults"]],
-  "ConnectionFile" -> Replace[
-    Lookup[Lookup[$BridgeState, "Directories", <||>], "Root", Missing["NoRoot"]],
-    root_String :> connectionFile[root]
-  ],
-  "SocketHost" -> Lookup[$BridgeState, "SocketHost", Missing["NoSocketHost"]],
-  "SocketPort" -> Lookup[$BridgeState, "SocketPort", Missing["NoSocketPort"]],
-  "SnapshotPath" -> Lookup[$BridgeState, "SnapshotPath", Missing["NoSnapshot"]],
-  "PollInterval" -> Lookup[$BridgeState, "PollInterval", Missing["NoInterval"]],
-  "KernelPID" -> Lookup[$BridgeState, "KernelPID", $ProcessID]
-|>;
+SharedKernelBridgeStatus[] := Module[{registryFile},
+  registryFile = refreshBridgeRegistry[];
+  <|
+    "Running" -> MatchQ[Lookup[$BridgeState, "SocketListener", Missing["NoSocketListener"]], _SocketListener],
+    "Transport" -> Lookup[$BridgeState, "Transport", Missing["NoTransport"]],
+    "NotebookAttached" -> MatchQ[Lookup[$BridgeState, "Notebook", Missing["NoNotebook"]], _NotebookObject],
+    "RegistryDirectory" -> bridgeRegistryDirectoryPath[],
+    "RegistryFile" -> registryFile,
+    "SocketHost" -> Lookup[$BridgeState, "SocketHost", Missing["NoSocketHost"]],
+    "SocketPort" -> Lookup[$BridgeState, "SocketPort", Missing["NoSocketPort"]],
+    "KernelPID" -> Lookup[$BridgeState, "KernelPID", $ProcessID]
+  |>
+];
 
 End[];
 

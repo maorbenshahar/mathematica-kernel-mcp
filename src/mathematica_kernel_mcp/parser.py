@@ -1,16 +1,24 @@
-"""Parse .m and .nb files into unified Cell models."""
+"""Parse .m, .wl, and .nb files into unified Cell models."""
 
+from __future__ import annotations
+
+import hashlib
 import re
 from pathlib import Path
-from uuid import uuid4
 
 from mathematica_kernel_mcp.models import Cell
 
-# Pattern matching Mathematica .m cell markers:
+# Pattern matching Mathematica package cell markers:
 # (* ::CellType:: *)
-# (* ::CellType:: [cell_id=cell-0001] *)
+# Legacy MCP versions also wrote [cell_id=...] metadata. We still parse those
+# markers as cell boundaries, but we no longer persist or trust the embedded IDs.
 CELL_MARKER_RE = re.compile(
     r"^\(\*\s*::(?P<cell_type>\w+)::(?:\s*\[cell_id=(?P<cell_id>[-\w]+)\])?\s*\*\)$"
+)
+
+SOURCE_REF_RE = re.compile(
+    r"^src:v1:(?P<number>\d+):(?P<start>\d+):(?P<end>\d+):"
+    r"(?P<cell_hash>[0-9a-f]{16}):(?P<file_hash>[0-9a-f]{16})$"
 )
 
 # Pattern for cell content wrapped in (* ... *)
@@ -19,8 +27,85 @@ EXECUTABLE_CELL_TYPES = {"Input", "Code"}
 MUTABLE_EXTENSIONS = {".m", ".wl"}
 
 
-def _default_cell_id(number: int) -> str:
-    return f"cell-{number:04d}"
+class StaleCellReferenceError(ValueError):
+    """A source-backed cell reference no longer matches the current file."""
+
+    def __init__(
+        self,
+        cell_ref: str,
+        reason: str,
+        *,
+        expected_file_hash: str | None = None,
+        current_file_hash: str | None = None,
+    ):
+        super().__init__(reason)
+        self.cell_ref = cell_ref
+        self.reason = reason
+        self.expected_file_hash = expected_file_hash
+        self.current_file_hash = current_file_hash
+
+    def to_payload(self) -> dict:
+        payload = {
+            "status": "stale_cell_reference",
+            "cellID": self.cell_ref,
+            "message": self.reason,
+        }
+        if self.expected_file_hash is not None:
+            payload["expectedFileHash"] = self.expected_file_hash
+        if self.current_file_hash is not None:
+            payload["currentFileHash"] = self.current_file_hash
+        return payload
+
+
+def _short_hash(text: str, length: int = 16) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:length]
+
+
+def _file_hash(text: str) -> str:
+    return _short_hash(text)
+
+
+def _cell_hash(cell_type: str, content: str, line_start: int, line_end: int) -> str:
+    return _short_hash(f"{cell_type}\0{line_start}\0{line_end}\0{content}")
+
+
+def _source_ref(
+    number: int,
+    cell_type: str,
+    content: str,
+    line_start: int,
+    line_end: int,
+    file_hash: str,
+) -> str:
+    digest = _cell_hash(cell_type, content, line_start, line_end)
+    return f"src:v1:{number}:{line_start}:{line_end}:{digest}:{file_hash}"
+
+
+def _source_ref_parts(cell_ref: str) -> dict | None:
+    match = SOURCE_REF_RE.match(cell_ref)
+    if not match:
+        return None
+    parts = match.groupdict()
+    return {
+        "number": int(parts["number"]),
+        "start": int(parts["start"]),
+        "end": int(parts["end"]),
+        "cell_hash": parts["cell_hash"],
+        "file_hash": parts["file_hash"],
+    }
+
+
+def _assign_source_refs(cells: list[Cell], file_hash: str) -> list[Cell]:
+    for cell in cells:
+        cell.cell_id = _source_ref(
+            cell.number,
+            cell.cell_type,
+            cell.content,
+            cell.line_start,
+            cell.line_end,
+            file_hash,
+        )
+    return cells
 
 
 def _normalize_cell_content(cell_type: str, content: str) -> str:
@@ -39,14 +124,6 @@ def _unmarked_cell_type(content: str) -> str:
     return "Input"
 
 
-def _next_generated_cell_id(cells: list[Cell]) -> str:
-    existing_ids = {cell.cell_id for cell in cells}
-    while True:
-        candidate = f"cell-{uuid4().hex[:8]}"
-        if candidate not in existing_ids:
-            return candidate
-
-
 def _validate_mutable_path(path: Path) -> None:
     if path.suffix.lower() not in MUTABLE_EXTENSIONS:
         raise ValueError("Cell mutation is currently only supported for .m and .wl files")
@@ -54,8 +131,10 @@ def _validate_mutable_path(path: Path) -> None:
 
 def _resolve_cell(
     cells: list[Cell],
+    *,
     cell_id: str | None = None,
     cell_number: int | None = None,
+    current_file_hash: str | None = None,
 ) -> tuple[int, Cell]:
     if cell_id is not None and cell_number is not None:
         raise ValueError("Use either `cell_id` or `cell`, not both")
@@ -63,6 +142,25 @@ def _resolve_cell(
         raise ValueError("Provide either `cell_id` or `cell`")
 
     if cell_id is not None:
+        parts = _source_ref_parts(cell_id)
+        if parts is not None:
+            if current_file_hash is not None and parts["file_hash"] != current_file_hash:
+                raise StaleCellReferenceError(
+                    cell_id,
+                    "The file changed after this source cell reference was read; re-read the notebook and retry.",
+                    expected_file_hash=parts["file_hash"],
+                    current_file_hash=current_file_hash,
+                )
+            for index, cell in enumerate(cells):
+                if cell.cell_id == cell_id:
+                    return index, cell
+            raise StaleCellReferenceError(
+                cell_id,
+                "The source cell reference no longer matches any current cell; re-read the notebook and retry.",
+                expected_file_hash=parts["file_hash"],
+                current_file_hash=current_file_hash,
+            )
+
         for index, cell in enumerate(cells):
             if cell.cell_id == cell_id:
                 return index, cell
@@ -76,7 +174,7 @@ def _resolve_cell(
 
 
 def _render_cell(cell: Cell) -> str:
-    marker = f"(* ::{cell.cell_type}:: [cell_id={cell.cell_id}] *)"
+    marker = f"(* ::{cell.cell_type}:: *)"
     content = cell.content.strip()
     if cell.cell_type in EXECUTABLE_CELL_TYPES or not content:
         body = content
@@ -86,7 +184,7 @@ def _render_cell(cell: Cell) -> str:
 
 
 def write_m_file(path: str | Path, cells: list[Cell]) -> None:
-    """Serialize cells back to a mutable .m/.wl file."""
+    """Serialize cells back to a mutable .m/.wl file without MCP cell IDs."""
     path = Path(path)
     _validate_mutable_path(path)
     rendered_cells = []
@@ -99,7 +197,7 @@ def write_m_file(path: str | Path, cells: list[Cell]) -> None:
     path.write_text(text)
 
 
-def _parse_unmarked_m_file(lines: list[str]) -> list[Cell]:
+def _parse_unmarked_m_lines(lines: list[str], file_hash: str) -> list[Cell]:
     """Best-effort fallback for legacy .m/.wl files without explicit cell markers."""
     cells: list[Cell] = []
     line_count = len(lines)
@@ -134,7 +232,7 @@ def _parse_unmarked_m_file(lines: list[str]) -> list[Cell]:
             cells.append(
                 Cell(
                     number=number,
-                    cell_id=_default_cell_id(number),
+                    cell_id="",
                     cell_type=cell_type,
                     content=_normalize_cell_content(cell_type, content),
                     line_start=start + 1,
@@ -144,23 +242,25 @@ def _parse_unmarked_m_file(lines: list[str]) -> list[Cell]:
 
         index = end
 
-    return cells
+    return _assign_source_refs(cells, file_hash)
 
 
 def parse_m_file(path: str | Path) -> list[Cell]:
-    """Parse a .m (Mathematica package) file into cells.
+    """Parse a .m/.wl package file into cells.
 
-    Cell boundaries are marked by (* ::CellType:: *) comments.
-    Content between markers belongs to the preceding cell type.
+    Cell boundaries are marked by Mathematica package comments such as
+    ``(* ::Section:: *)``. Returned cell IDs are source refs derived from the
+    current file content; they are never persisted into the source file.
     """
     path = Path(path)
-    lines = path.read_text().splitlines()
+    text = path.read_text()
+    file_hash = _file_hash(text)
+    lines = text.splitlines()
     if not any(CELL_MARKER_RE.match(line.strip()) for line in lines):
-        return _parse_unmarked_m_file(lines)
+        return _parse_unmarked_m_lines(lines, file_hash)
 
     cells: list[Cell] = []
     current_type: str | None = None
-    current_cell_id: str | None = None
     current_lines: list[str] = []
     current_start: int = 0
     cell_count = 0
@@ -173,7 +273,7 @@ def parse_m_file(path: str | Path) -> list[Cell]:
             cells.append(
                 Cell(
                     number=cell_count,
-                    cell_id=current_cell_id or _default_cell_id(cell_count),
+                    cell_id="",
                     cell_type=current_type,
                     content=content,
                     line_start=current_start,
@@ -186,16 +286,13 @@ def parse_m_file(path: str | Path) -> list[Cell]:
         if marker_match:
             flush_cell()
             current_type = marker_match.group("cell_type")
-            current_cell_id = marker_match.group("cell_id")
             current_lines = []
             current_start = i + 1  # content starts on next line
         elif current_type is not None:
             current_lines.append(line)
 
-    # Flush the last cell
     flush_cell()
-
-    return cells
+    return _assign_source_refs(cells, file_hash)
 
 
 def parse_nb_file(path: str | Path) -> list[Cell]:
@@ -210,9 +307,8 @@ def parse_nb_file(path: str | Path) -> list[Cell]:
     cells: list[Cell] = []
     cell_count = 0
 
-    # .nb files contain Cell[content, "CellType", ...] expressions
-    # We use a simple regex approach for common cases
-    # This handles: Cell[BoxData[...], "Input", ...] and Cell["text", "Section", ...]
+    # .nb files contain Cell[content, "CellType", ...] expressions.
+    # This is a simple fallback parser; live/solo kernel paths use richer APIs.
     cell_pattern = re.compile(
         r'Cell\[([^]]*(?:\[[^]]*\])*[^]]*),\s*"(\w+)"',
         re.MULTILINE,
@@ -223,17 +319,14 @@ def parse_nb_file(path: str | Path) -> list[Cell]:
         raw_content = match.group(1)
         cell_type = match.group(2)
 
-        # Try to extract readable content from BoxData or raw strings
         content = _extract_cell_content(raw_content)
-
-        # Approximate line numbers from character offset
         line_start = text[:match.start()].count("\n") + 1
         line_end = text[:match.end()].count("\n") + 1
 
         cells.append(
             Cell(
                 number=cell_count,
-                cell_id=_default_cell_id(cell_count),
+                cell_id=f"cell-{cell_count:04d}",
                 cell_type=cell_type,
                 content=content,
                 line_start=line_start,
@@ -246,14 +339,10 @@ def parse_nb_file(path: str | Path) -> list[Cell]:
 
 def _extract_cell_content(raw: str) -> str:
     """Best-effort extraction of readable content from .nb cell data."""
-    # String content: "some text"
     string_match = re.match(r'^"(.*)"$', raw.strip(), re.DOTALL)
     if string_match:
         return string_match.group(1)
 
-    # BoxData with RowBox containing string tokens
-    # This is a simplification — real .nb parsing would need a full
-    # Mathematica expression parser. For now, extract quoted strings.
     strings = re.findall(r'"([^"]*)"', raw)
     if strings:
         return "".join(strings)
@@ -262,15 +351,32 @@ def _extract_cell_content(raw: str) -> str:
 
 
 def parse_file(path: str | Path) -> list[Cell]:
-    """Parse a .m or .nb file into cells, choosing parser by extension."""
+    """Parse a .m, .wl, or .nb file into cells, choosing parser by extension."""
     path = Path(path)
     ext = path.suffix.lower()
-    if ext == ".m" or ext == ".wl":
+    if ext in {".m", ".wl"}:
         return parse_m_file(path)
-    elif ext == ".nb":
+    if ext == ".nb":
         return parse_nb_file(path)
-    else:
-        raise ValueError(f"Unsupported file extension: {ext}. Expected .m, .wl, or .nb")
+    raise ValueError(f"Unsupported file extension: {ext}. Expected .m, .wl, or .nb")
+
+
+def resolve_m_cell(
+    path: str | Path,
+    *,
+    cell_id: str | None = None,
+    cell_number: int | None = None,
+) -> Cell:
+    path = Path(path)
+    text = path.read_text()
+    cells = parse_m_file(path)
+    _, cell = _resolve_cell(
+        cells,
+        cell_id=cell_id,
+        cell_number=cell_number,
+        current_file_hash=_file_hash(text),
+    )
+    return cell
 
 
 def create_m_cell(
@@ -283,10 +389,16 @@ def create_m_cell(
     before_cell: int | None = None,
     after_cell: int | None = None,
 ) -> Cell:
-    """Insert a new cell into a mutable .m/.wl file and persist cell IDs."""
+    """Insert a new cell into a mutable .m/.wl file without writing MCP IDs."""
     path = Path(path)
     _validate_mutable_path(path)
-    cells = parse_m_file(path) if path.exists() else []
+    if path.exists():
+        text = path.read_text()
+        cells = parse_m_file(path)
+        current_file_hash = _file_hash(text)
+    else:
+        cells = []
+        current_file_hash = _file_hash("")
 
     selector_count = sum(
         value is not None
@@ -297,14 +409,24 @@ def create_m_cell(
 
     insert_at = len(cells)
     if before_cell_id is not None or before_cell is not None:
-        insert_at, _ = _resolve_cell(cells, cell_id=before_cell_id, cell_number=before_cell)
+        insert_at, _ = _resolve_cell(
+            cells,
+            cell_id=before_cell_id,
+            cell_number=before_cell,
+            current_file_hash=current_file_hash,
+        )
     elif after_cell_id is not None or after_cell is not None:
-        insert_at, _ = _resolve_cell(cells, cell_id=after_cell_id, cell_number=after_cell)
+        insert_at, _ = _resolve_cell(
+            cells,
+            cell_id=after_cell_id,
+            cell_number=after_cell,
+            current_file_hash=current_file_hash,
+        )
         insert_at += 1
 
     new_cell = Cell(
         number=insert_at + 1,
-        cell_id=_next_generated_cell_id(cells),
+        cell_id="",
         cell_type=cell_type,
         content=_normalize_cell_content(cell_type, content),
         line_start=0,
@@ -312,7 +434,7 @@ def create_m_cell(
     )
     cells.insert(insert_at, new_cell)
     write_m_file(path, cells)
-    return _resolve_cell(parse_m_file(path), cell_id=new_cell.cell_id)[1]
+    return parse_m_file(path)[insert_at]
 
 
 def update_m_cell(
@@ -329,14 +451,20 @@ def update_m_cell(
     if content is None and cell_type is None:
         raise ValueError("Provide `content`, `cell_type`, or both")
 
+    text = path.read_text()
     cells = parse_m_file(path)
-    _, cell = _resolve_cell(cells, cell_id=cell_id, cell_number=cell_number)
+    index, cell = _resolve_cell(
+        cells,
+        cell_id=cell_id,
+        cell_number=cell_number,
+        current_file_hash=_file_hash(text),
+    )
     if cell_type is not None:
         cell.cell_type = cell_type
     if content is not None:
         cell.content = _normalize_cell_content(cell.cell_type, content)
     write_m_file(path, cells)
-    return _resolve_cell(parse_m_file(path), cell_id=cell.cell_id)[1]
+    return parse_m_file(path)[index]
 
 
 def delete_m_cell(
@@ -348,8 +476,14 @@ def delete_m_cell(
     """Delete a cell from a mutable .m/.wl file."""
     path = Path(path)
     _validate_mutable_path(path)
+    text = path.read_text()
     cells = parse_m_file(path)
-    index, cell = _resolve_cell(cells, cell_id=cell_id, cell_number=cell_number)
+    index, cell = _resolve_cell(
+        cells,
+        cell_id=cell_id,
+        cell_number=cell_number,
+        current_file_hash=_file_hash(text),
+    )
     removed = cells.pop(index)
     write_m_file(path, cells)
     return removed

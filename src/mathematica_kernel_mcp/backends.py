@@ -5,13 +5,13 @@ based on whether a shared-kernel bridge is present:
 
 - `BridgeBackend` (collaborative): the user has Mathematica open with the file +
   `StartSharedKernelBridge[...]` evaluated. We talk to the user's kernel via the
-  authenticated socket bridge when available, with the file queue as fallback;
-  edits land live in their open notebook; kernel state is shared.
+  authenticated socket bridge; edits land live in their open notebook; kernel
+  state is shared.
 - `SoloBackend` (solo): no bridge. We mutate the `.m`/`.nb` file on disk and run
   code in a kernel the MCP spawns via wolframclient. The user is not involved.
 
 A `get_backend_for(path)` dispatcher picks the right backend based on whether
-`<file_dir>/.shared_kernel_bridge/<filename>/` exists next to the target file.
+a matching bridge exists in the global bridge registry.
 """
 
 from __future__ import annotations
@@ -19,9 +19,8 @@ from __future__ import annotations
 import json
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
-from pathlib import Path
 
-from .bridge import SharedKernelBridge
+from .bridge import SharedKernelBridge, bridge_record_for_file
 from .notebook import (
     create_nb_cell,
     delete_nb_cell,
@@ -29,7 +28,14 @@ from .notebook import (
     parse_nb_file_with_kernel,
     update_nb_cell,
 )
-from .parser import create_m_cell, delete_m_cell, parse_file, update_m_cell
+from .parser import (
+    StaleCellReferenceError,
+    create_m_cell,
+    delete_m_cell,
+    parse_file,
+    resolve_m_cell,
+    update_m_cell,
+)
 
 
 class Backend(ABC):
@@ -88,27 +94,34 @@ class Backend(ABC):
     def sweep_outputs(self, path: str) -> dict: ...
 
     @abstractmethod
-    def evaluate_for_json(self, code: str): ...
-    """Evaluate a WL expression that produces a JSON-serializable result, return Python object."""
+    def evaluate_for_json(self, code: str):
+        """Evaluate a WL expression and return its JSON-serializable result."""
+        ...
 
     @abstractmethod
-    def kernel_restart(self) -> dict: ...
-    """Restart the underlying kernel. In collab mode this is refused (it would
-    clobber the user's session). In solo mode it restarts the spawned kernel."""
+    def kernel_restart(self) -> dict:
+        """Restart the underlying kernel; collab mode refuses this."""
+        ...
 
     @abstractmethod
-    def abort_evaluation(
-        self, signal: str = "SIGINT", clear_queue: bool = False
-    ) -> dict: ...
-    """Signal the kernel to abort its current evaluation. In collab mode this
-    sends SIGINT/SIGTERM to the user's kernel PID (the same mechanism the
-    Mathematica front-end uses for its Abort button). In solo mode this
-    signals the MCP-spawned kernel."""
+    def abort_evaluation(self, signal: str = "SIGINT") -> dict:
+        """Signal the underlying kernel to abort its current evaluation."""
+        ...
 
 
 # ---------------------------------------------------------------------------
 # Bridge (collaborative) backend
 # ---------------------------------------------------------------------------
+
+
+def _integer_cell_id(value, *, label: str = "cell_id") -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{label} must be an integer CellID in collab/.nb mode, or a "
+            "source ref returned by notebook_read for solo .m/.wl files"
+        ) from exc
 
 
 class BridgeBackend(Backend):
@@ -131,28 +144,47 @@ class BridgeBackend(Backend):
         )
 
     def run_cell(self, path: str, cell_id, eval_timeout: float | None = None) -> dict:
-        return self.bridge.run_cell(path, int(cell_id), eval_timeout=eval_timeout)
+        return self.bridge.run_cell(
+            path, _integer_cell_id(cell_id), eval_timeout=eval_timeout
+        )
 
     def update_cell(self, path, cell_id, cell_type, content):
-        return self.bridge.update_cell(path, int(cell_id), cell_type, content)
+        return self.bridge.update_cell(
+            path, _integer_cell_id(cell_id), cell_type, content
+        )
 
     def insert_cell_after(self, path, anchor_cell_id, cell_type, content):
-        return self.bridge.insert_cell_after(path, int(anchor_cell_id), cell_type, content)
+        return self.bridge.insert_cell_after(
+            path,
+            _integer_cell_id(anchor_cell_id, label="anchor_cell_id"),
+            cell_type,
+            content,
+        )
 
     def insert_cell_before(self, path, anchor_cell_id, cell_type, content):
-        return self.bridge.insert_cell_before(path, int(anchor_cell_id), cell_type, content)
+        return self.bridge.insert_cell_before(
+            path,
+            _integer_cell_id(anchor_cell_id, label="anchor_cell_id"),
+            cell_type,
+            content,
+        )
 
     def delete_cell(self, path, cell_id):
-        return self.bridge.delete_cell(path, int(cell_id))
+        return self.bridge.delete_cell(path, _integer_cell_id(cell_id))
 
-    def evaluate(self, path, code, eval_timeout: float | None = None):
+    def evaluate(self, _path, code, eval_timeout: float | None = None):
         return self.bridge.evaluate(code, eval_timeout=eval_timeout)
 
     def eval_inline(
         self, path, anchor_cell_id, code, cell_type="Code",
         eval_timeout: float | None = None,
     ):
-        ins = self.bridge.insert_cell_after(path, int(anchor_cell_id), cell_type, code)
+        ins = self.bridge.insert_cell_after(
+            path,
+            _integer_cell_id(anchor_cell_id, label="anchor_cell_id"),
+            cell_type,
+            code,
+        )
         new_id = ins.get("newCellID")
         if new_id is None:
             return {"error": "insert_failed", "insert_result": ins}
@@ -160,8 +192,12 @@ class BridgeBackend(Backend):
         return {
             "status": run.get("status"),
             "newCellID": new_id,
-            "anchorCellID": int(anchor_cell_id),
+            "anchorCellID": _integer_cell_id(anchor_cell_id, label="anchor_cell_id"),
             "resultInputForm": run.get("resultInputForm"),
+            "resultInputFormTruncated": run.get("resultInputFormTruncated"),
+            "resultInputFormChars": run.get("resultInputFormChars"),
+            "inNumber": run.get("inNumber"),
+            "outNumber": run.get("outNumber"),
             "messages": run.get("messages", []),
             "prints": run.get("prints", []),
             "durationSeconds": run.get("durationSeconds"),
@@ -183,10 +219,8 @@ class BridgeBackend(Backend):
             ),
         }
 
-    def abort_evaluation(
-        self, signal: str = "SIGINT", clear_queue: bool = False
-    ) -> dict:
-        return self.bridge.abort_evaluation(signal=signal, clear_queue=clear_queue)
+    def abort_evaluation(self, signal: str = "SIGINT") -> dict:
+        return self.bridge.abort_evaluation(signal=signal)
 
 
 # ---------------------------------------------------------------------------
@@ -194,14 +228,33 @@ class BridgeBackend(Backend):
 # ---------------------------------------------------------------------------
 
 
-def _cell_to_payload(cell) -> dict:
+def _cell_to_payload(cell, *, source_refs: bool = False) -> dict:
     """Render a parser `Cell` as the same dict shape BridgeBackend returns."""
-    return {
+    payload = {
         "index": cell.number,
-        "cellID": cell.number,  # 1-indexed position; stable within a single read
+        "cellID": cell.cell_id if source_refs else cell.number,
         "style": cell.cell_type,
         "content": cell.content,
     }
+    if source_refs:
+        payload.update(
+            {
+                "sourceRef": cell.cell_id,
+                "lineStart": cell.line_start,
+                "lineEnd": cell.line_end,
+            }
+        )
+    return payload
+
+
+def _cell_selector(cell_id):
+    if isinstance(cell_id, str) and cell_id.startswith("src:v1:"):
+        return {"cell_id": cell_id}
+    return {"cell_number": _integer_cell_id(cell_id)}
+
+
+def _stale_reference_payload(exc: StaleCellReferenceError) -> dict:
+    return exc.to_payload()
 
 
 class SoloBackend(Backend):
@@ -211,17 +264,25 @@ class SoloBackend(Backend):
         # manager: SessionManager (lazy-started by the caller)
         self.manager = manager
 
+    def _source_refs_for(self, path: str) -> bool:
+        return not is_notebook_path(path)
+
     def _parse(self, path: str):
         if is_notebook_path(path):
             return parse_nb_file_with_kernel(path, self.manager)
         return parse_file(path)
 
-    def _resolve(self, cells, cell_id):
+    def _resolve_position(self, cells, cell_id):
         cid = int(cell_id)
         for c in cells:
             if c.number == cid:
                 return c
         raise ValueError(f"cell {cid} not found (file has {len(cells)} cells)")
+
+    def _resolve(self, path: str, cell_id):
+        if is_notebook_path(path):
+            return self._resolve_position(self._parse(path), cell_id)
+        return resolve_m_cell(path, **_cell_selector(cell_id))
 
     def read(
         self,
@@ -231,7 +292,8 @@ class SoloBackend(Backend):
         preview_chars: int = 80,
     ):
         cells = self._parse(path)
-        payload_cells = [_cell_to_payload(c) for c in cells]
+        source_refs = self._source_refs_for(path)
+        payload_cells = [_cell_to_payload(c, source_refs=source_refs) for c in cells]
         if not include_content:
             for c in payload_cells:
                 flat = c.get("content", "").replace("\n", " ")
@@ -248,12 +310,16 @@ class SoloBackend(Backend):
         }
 
     def run_cell(self, path, cell_id, eval_timeout: float | None = None):
-        cells = self._parse(path)
-        cell = self._resolve(cells, cell_id)
+        try:
+            cell = self._resolve(path, cell_id)
+        except StaleCellReferenceError as exc:
+            return _stale_reference_payload(exc)
+
         if cell.cell_type not in {"Input", "Code"}:
             return {
                 "status": "skipped",
-                "cellID": cell.number,
+                "cellID": cell.cell_id if self._source_refs_for(path) else cell.number,
+                "index": cell.number,
                 "reason": "not_executable",
                 "cellType": cell.cell_type,
             }
@@ -261,7 +327,8 @@ class SoloBackend(Backend):
         result = self.manager.evaluate(cell.content, **kwargs)
         return {
             "status": "ok",
-            "cellID": cell.number,
+            "cellID": cell.cell_id if self._source_refs_for(path) else cell.number,
+            "index": cell.number,
             "resultInputForm": result.output_summary,
             "messages": result.messages,
             "in_number": result.in_number,
@@ -279,62 +346,95 @@ class SoloBackend(Backend):
 
     def update_cell(self, path, cell_id, cell_type, content):
         _, update, _, is_nb = self._mutating_helpers(path)
-        if is_nb:
-            new_cell = update(
-                path, self.manager, cell_number=int(cell_id),
-                content=content, cell_type=cell_type,
-            )
-        else:
-            new_cell = update(
-                path, cell_number=int(cell_id), content=content, cell_type=cell_type
-            )
-        return {"status": "ok", "cellID": new_cell.number, "cellType": new_cell.cell_type}
+        try:
+            if is_nb:
+                new_cell = update(
+                    path, self.manager, cell_number=int(cell_id),
+                    content=content, cell_type=cell_type,
+                )
+                returned_id = new_cell.number
+            else:
+                new_cell = update(
+                    path,
+                    **_cell_selector(cell_id),
+                    content=content,
+                    cell_type=cell_type,
+                )
+                returned_id = new_cell.cell_id
+        except StaleCellReferenceError as exc:
+            return _stale_reference_payload(exc)
+        return {"status": "ok", "cellID": returned_id, "cellType": new_cell.cell_type}
 
     def insert_cell_after(self, path, anchor_cell_id, cell_type, content):
         create, _, _, is_nb = self._mutating_helpers(path)
-        if is_nb:
-            new_cell = create(
-                path, self.manager, cell_type, content,
-                after_cell=int(anchor_cell_id),
-            )
-        else:
-            new_cell = create(
-                path, cell_type, content, after_cell=int(anchor_cell_id)
-            )
+        try:
+            if is_nb:
+                new_cell = create(
+                    path, self.manager, cell_type, content,
+                    after_cell=int(anchor_cell_id),
+                )
+                new_id = new_cell.number
+            else:
+                selector = _cell_selector(anchor_cell_id)
+                new_cell = create(
+                    path,
+                    cell_type,
+                    content,
+                    after_cell=selector.get("cell_number"),
+                    after_cell_id=selector.get("cell_id"),
+                )
+                new_id = new_cell.cell_id
+        except StaleCellReferenceError as exc:
+            return _stale_reference_payload(exc)
         return {
             "status": "ok",
-            "newCellID": new_cell.number,
-            "anchorCellID": int(anchor_cell_id),
+            "newCellID": new_id,
+            "anchorCellID": anchor_cell_id,
             "position": "After",
         }
 
     def insert_cell_before(self, path, anchor_cell_id, cell_type, content):
         create, _, _, is_nb = self._mutating_helpers(path)
-        if is_nb:
-            new_cell = create(
-                path, self.manager, cell_type, content,
-                before_cell=int(anchor_cell_id),
-            )
-        else:
-            new_cell = create(
-                path, cell_type, content, before_cell=int(anchor_cell_id)
-            )
+        try:
+            if is_nb:
+                new_cell = create(
+                    path, self.manager, cell_type, content,
+                    before_cell=int(anchor_cell_id),
+                )
+                new_id = new_cell.number
+            else:
+                selector = _cell_selector(anchor_cell_id)
+                new_cell = create(
+                    path,
+                    cell_type,
+                    content,
+                    before_cell=selector.get("cell_number"),
+                    before_cell_id=selector.get("cell_id"),
+                )
+                new_id = new_cell.cell_id
+        except StaleCellReferenceError as exc:
+            return _stale_reference_payload(exc)
         return {
             "status": "ok",
-            "newCellID": new_cell.number,
-            "anchorCellID": int(anchor_cell_id),
+            "newCellID": new_id,
+            "anchorCellID": anchor_cell_id,
             "position": "Before",
         }
 
     def delete_cell(self, path, cell_id):
         _, _, delete, is_nb = self._mutating_helpers(path)
-        if is_nb:
-            removed = delete(path, self.manager, cell_number=int(cell_id))
-        else:
-            removed = delete(path, cell_number=int(cell_id))
-        return {"status": "ok", "deletedCellID": removed.number}
+        try:
+            if is_nb:
+                removed = delete(path, self.manager, cell_number=int(cell_id))
+                removed_id = removed.number
+            else:
+                removed = delete(path, **_cell_selector(cell_id))
+                removed_id = removed.cell_id
+        except StaleCellReferenceError as exc:
+            return _stale_reference_payload(exc)
+        return {"status": "ok", "deletedCellID": removed_id}
 
-    def evaluate(self, path, code, eval_timeout: float | None = None):
+    def evaluate(self, _path, code, eval_timeout: float | None = None):
         kwargs = {"timeout": int(eval_timeout)} if eval_timeout else {}
         result = self.manager.evaluate(code, **kwargs)
         return {
@@ -362,12 +462,12 @@ class SoloBackend(Backend):
         return {
             "status": run.get("status"),
             "newCellID": new_id,
-            "anchorCellID": int(anchor_cell_id),
+            "anchorCellID": anchor_cell_id,
             "resultInputForm": run.get("resultInputForm"),
             "messages": run.get("messages", []),
         }
 
-    def sweep_outputs(self, path):
+    def sweep_outputs(self, _path):
         # No-op in solo mode: .m files don't persist Output cells; .nb files
         # could in principle, but cleanup is the user's call there. Treat as a
         # success that did nothing rather than failing.
@@ -381,16 +481,12 @@ class SoloBackend(Backend):
         self.manager.restart_session("main")
         return {"status": "ok", "restarted": "main"}
 
-    def abort_evaluation(
-        self, signal: str = "SIGINT", clear_queue: bool = False
-    ) -> dict:
-        # `clear_queue` is collab-only (no file queue exists in solo mode); ignored here.
+    def abort_evaluation(self, signal: str = "SIGINT") -> dict:
         pid = self.manager.abort_session("main", signal=signal)
         return {
             "status": "ok",
             "pid": pid,
             "signal": signal.upper(),
-            "cleared_queue_files": [],
         }
 
 
@@ -400,9 +496,7 @@ class SoloBackend(Backend):
 
 
 def has_bridge_for(path: str) -> bool:
-    p = Path(path).resolve()
-    bridge_root = p.parent / ".shared_kernel_bridge" / p.name
-    return (bridge_root / "queue").exists() and (bridge_root / "results").exists()
+    return bridge_record_for_file(path, include_tokens=False) is not None
 
 
 def get_backend_for(path: str, manager_factory, timeout: float = 30.0) -> Backend:

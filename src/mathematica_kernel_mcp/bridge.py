@@ -1,21 +1,15 @@
-"""Client for the shared kernel bridge.
+"""Socket client and discovery helpers for the shared kernel bridge."""
 
-Newer bridge instances expose an authenticated localhost JSON-lines socket.
-Older instances use the file queue protocol: the MCP drops a `.wl` file into
-`<bridge_root>/queue/`, the bridge running in the user's Mathematica kernel
-polls and evaluates it, and writes the result as JSON to
-`<bridge_root>/results/<id>.json`. This client supports both protocols.
-"""
-
+from contextlib import suppress
 from dataclasses import dataclass
 from ipaddress import ip_address
 import json
 import os
 import signal as _signal
 import socket
-import time
 import uuid
 from pathlib import Path
+from typing import Any
 
 
 class BridgeError(RuntimeError):
@@ -23,7 +17,7 @@ class BridgeError(RuntimeError):
 
 
 class BridgeTimeout(BridgeError):
-    """Bridge call did not produce a result file within the allotted time."""
+    """Bridge call timed out."""
 
 
 @dataclass(frozen=True)
@@ -33,49 +27,255 @@ class SocketConnection:
     host: str
     port: int
     token: str
-    protocol: str = "json-lines"
+    protocol: str = "jsonl-content-length-v1"
+    kernel_pid: int | None = None
 
 
 _ABORT_SIGNALS = {
     "SIGINT": _signal.SIGINT,
     "SIGTERM": _signal.SIGTERM,
 }
+REGISTRY_ENV_VAR = "MATHEMATICA_KERNEL_MCP_REGISTRY_DIR"
+
+
+def bridge_registry_directories() -> list[Path]:
+    """Return candidate global bridge registry directories."""
+    candidates: list[Path] = []
+    env_dir = os.environ.get(REGISTRY_ENV_VAR)
+    if env_dir:
+        candidates.append(Path(env_dir).expanduser())
+
+    home = Path.home()
+    candidates.extend(
+        [
+            home / ".Wolfram" / "ApplicationData" / "SharedKernelMCP" / "bridges",
+            home / ".Mathematica" / "ApplicationData" / "SharedKernelMCP" / "bridges",
+            home
+            / "Library"
+            / "Mathematica"
+            / "ApplicationData"
+            / "SharedKernelMCP"
+            / "bridges",
+        ]
+    )
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        candidates.append(
+            Path(appdata)
+            / "Mathematica"
+            / "ApplicationData"
+            / "SharedKernelMCP"
+            / "bridges"
+        )
+        candidates.append(
+            Path(appdata)
+            / "Wolfram"
+            / "ApplicationData"
+            / "SharedKernelMCP"
+            / "bridges"
+        )
+
+    seen: set[Path] = set()
+    result: list[Path] = []
+    for candidate in candidates:
+        resolved = candidate.expanduser()
+        if resolved not in seen:
+            seen.add(resolved)
+            result.append(resolved)
+    return result
+
+
+def _registry_record_files() -> list[Path]:
+    files: list[Path] = []
+    for directory in bridge_registry_directories():
+        if directory.is_dir():
+            files.extend(sorted(directory.glob("*.json")))
+    return files
+
+
+def _load_registry_record(path: Path) -> dict[str, Any] | None:
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(record, dict):
+        return None
+    record["_registry_file"] = str(path)
+    return record
+
+
+def _is_loopback_host(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _pid_is_alive(pid: Any) -> bool | None:
+    try:
+        pid_int = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if pid_int <= 0:
+        return None
+    try:
+        os.kill(pid_int, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return None
+    return True
+
+
+def _socket_connection_from_mapping(payload: dict[str, Any]) -> SocketConnection:
+    if str(payload.get("transport", "")).lower() != "socket":
+        raise BridgeError(
+            f"Bridge record has transport={payload.get('transport')!r}; expected 'Socket'."
+        )
+
+    host = str(payload.get("host", ""))
+    if not _is_loopback_host(host):
+        raise BridgeError(f"Refusing socket bridge host {host!r}; expected loopback.")
+
+    try:
+        port = int(payload["port"])
+        token = str(payload["token"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise BridgeError(f"Malformed socket bridge record: {exc}") from exc
+
+    if not (0 < port < 65536) or not token:
+        raise BridgeError("Malformed socket bridge record: invalid port or token.")
+
+    pid = payload.get("kernelPID")
+    try:
+        kernel_pid = int(pid) if pid is not None else None
+    except (TypeError, ValueError):
+        kernel_pid = None
+    if kernel_pid is not None and kernel_pid <= 0:
+        kernel_pid = None
+
+    return SocketConnection(
+        host=host,
+        port=port,
+        token=token,
+        protocol=str(payload.get("protocol", "jsonl-content-length-v1")),
+        kernel_pid=kernel_pid,
+    )
+
+
+def _record_socket_ok(record: dict[str, Any]) -> bool:
+    try:
+        _socket_connection_from_mapping(record)
+    except BridgeError:
+        return False
+    return True
+
+
+def _normal_path(value: str | Path) -> str:
+    return str(Path(value).expanduser().resolve())
+
+
+def _record_notebook_paths(record: dict[str, Any]) -> list[str]:
+    paths: list[str] = []
+    notebook_path = record.get("notebookPath")
+    if isinstance(notebook_path, str) and notebook_path:
+        paths.append(notebook_path)
+    notebooks = record.get("notebooks")
+    if isinstance(notebooks, list):
+        for notebook in notebooks:
+            if isinstance(notebook, dict):
+                path = notebook.get("path")
+                if isinstance(path, str) and path:
+                    paths.append(path)
+    return paths
+
+
+def _record_matches_path(record: dict[str, Any], file_path: str | Path) -> bool:
+    target = _normal_path(file_path)
+    for notebook_path in _record_notebook_paths(record):
+        try:
+            if _normal_path(notebook_path) == target:
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def discover_bridge_records(
+    *,
+    include_stale: bool = False,
+    prune_stale: bool = False,
+    include_tokens: bool = False,
+) -> list[dict[str, Any]]:
+    """Load global socket bridge registry records written by Mathematica kernels."""
+    records: list[dict[str, Any]] = []
+    for file in _registry_record_files():
+        record = _load_registry_record(file)
+        if record is None:
+            continue
+        alive = _pid_is_alive(record.get("kernelPID"))
+        socket_ok = _record_socket_ok(record)
+        stale = alive is False or not socket_ok
+        if stale and prune_stale:
+            with suppress(OSError):
+                file.unlink()
+        if stale and not include_stale:
+            continue
+        payload = dict(record)
+        payload["is_alive"] = alive
+        payload["socket_ok"] = socket_ok
+        if not include_tokens:
+            payload.pop("token", None)
+        records.append(payload)
+    return records
+
+
+def bridge_record_for_file(
+    file_path: str | Path,
+    *,
+    include_tokens: bool = True,
+) -> dict[str, Any] | None:
+    """Return the newest live registry record for a notebook path, if any."""
+    p = Path(file_path).resolve()
+    candidates = [
+        record
+        for record in discover_bridge_records(include_tokens=include_tokens)
+        if _record_matches_path(record, p)
+    ]
+    candidates.sort(key=lambda r: str(r.get("lastSeen", "")), reverse=True)
+    return candidates[0] if candidates else None
 
 
 class SharedKernelBridge:
-    """Client for the in-notebook shared kernel bridge."""
+    """Client for the in-notebook shared kernel socket bridge."""
 
-    DEFAULT_DIR = ".shared_kernel_bridge"
-    POLL_INTERVAL = 0.2
     DEFAULT_TIMEOUT = 30.0
 
-    def __init__(self, root_dir: str | Path, timeout: float = DEFAULT_TIMEOUT):
-        self.root = Path(root_dir).resolve()
-        self.queue_dir = self.root / "queue"
-        self.results_dir = self.root / "results"
-        self.connection_file = self.root / "connection.json"
+    def __init__(
+        self,
+        socket_connection: SocketConnection,
+        timeout: float = DEFAULT_TIMEOUT,
+    ):
+        self.socket_connection = socket_connection
         self.timeout = timeout
-        if not self.queue_dir.exists() or not self.results_dir.exists():
-            raise BridgeError(
-                f"No shared kernel bridge at {self.root}; expected `queue/` and `results/` "
-                f"subdirectories. Start the bridge in a Mathematica notebook with "
-                f"`StartSharedKernelBridge[\"RootDirectory\" -> \"{self.root}\"]`."
-            )
-        self.socket_connection = self._load_socket_connection()
 
     @classmethod
     def for_file(
         cls, file_path: str | Path, timeout: float = DEFAULT_TIMEOUT
     ) -> "SharedKernelBridge":
-        """Locate the bridge by looking next to the given file.
-
-        Each notebook gets its own bridge subtree at
-        ``<file_dir>/.shared_kernel_bridge/<filename>/`` so multiple files in
-        one directory can run independent bridges without sharing a queue.
-        """
-        p = Path(file_path).resolve()
-        bridge_root = p.parent / cls.DEFAULT_DIR / p.name
-        return cls(bridge_root, timeout=timeout)
+        """Locate the socket bridge for a file from the global registry."""
+        record = bridge_record_for_file(file_path, include_tokens=True)
+        if record is None:
+            raise BridgeError(
+                f"No live shared kernel socket bridge is registered for {file_path!s}. "
+                "Start the bridge in the Mathematica notebook with "
+                "`StartSharedKernelBridge[]`."
+            )
+        return cls(_socket_connection_from_mapping(record), timeout=timeout)
 
     def call(
         self,
@@ -84,16 +284,14 @@ class SharedKernelBridge:
         silent: bool = True,
         eval_timeout: float | None = None,
     ) -> dict:
-        """Drop a queue file with the given WL code and wait for the JSON result.
+        """Evaluate Wolfram Language code through the authenticated socket bridge.
 
         `eval_timeout` (seconds) is enforced kernel-side via `TimeConstrained`: if
         the evaluation runs longer, the bridge aborts it and returns status
-        "timeout". This is distinct from `self.timeout`, which only bounds how
-        long the Python side waits for the result file.
+        "timeout". This is distinct from `self.timeout`, which bounds the socket
+        call itself.
         """
         cmd_id = f"mcp_{uuid.uuid4().hex[:12]}"
-        queue_file = self.queue_dir / f"{cmd_id}.wl"
-        results_file = self.results_dir / f"{cmd_id}.json"
 
         markers = []
         if silent:
@@ -103,72 +301,9 @@ class SharedKernelBridge:
         prefix = ("\n".join(markers) + "\n") if markers else ""
         command = prefix + code
 
-        if self.socket_connection is not None:
-            return self._call_socket(cmd_id, command)
-
-        queue_file.write_text(command, encoding="utf-8")
-
-        deadline = time.time() + self.timeout
-        while time.time() < deadline:
-            if results_file.exists():
-                with results_file.open() as f:
-                    return json.load(f)
-            time.sleep(self.POLL_INTERVAL)
-
-        raise BridgeTimeout(f"Bridge call {cmd_id} timed out after {self.timeout}s")
-
-    @staticmethod
-    def _is_loopback_host(host: str) -> bool:
-        if host == "localhost":
-            return True
-        try:
-            return ip_address(host).is_loopback
-        except ValueError:
-            return False
-
-    def _load_socket_connection(self) -> SocketConnection | None:
-        if not self.connection_file.exists():
-            return None
-        try:
-            payload = json.loads(self.connection_file.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise BridgeError(
-                f"Malformed socket bridge metadata at {self.connection_file}: {exc}"
-            ) from exc
-
-        if payload.get("transport") != "socket":
-            return None
-
-        host = str(payload.get("host", ""))
-        if not self._is_loopback_host(host):
-            raise BridgeError(
-                f"Refusing socket bridge host {host!r}; expected a loopback host."
-            )
-
-        try:
-            port = int(payload["port"])
-            token = str(payload["token"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise BridgeError(
-                f"Malformed socket bridge metadata at {self.connection_file}: {exc}"
-            ) from exc
-
-        if not (0 < port < 65536) or not token:
-            raise BridgeError(
-                f"Malformed socket bridge metadata at {self.connection_file}: "
-                "invalid port or token."
-            )
-
-        protocol = str(payload.get("protocol", "json-lines"))
-        return SocketConnection(
-            host=host,
-            port=port,
-            token=token,
-            protocol=protocol,
-        )
+        return self._call_socket(cmd_id, command)
 
     def _read_socket_response(self, sock: socket.socket, cmd_id: str) -> bytes:
-        assert self.socket_connection is not None
         if self.socket_connection.protocol != "jsonl-content-length-v1":
             with sock.makefile("rb") as response:
                 return response.read()
@@ -218,7 +353,6 @@ class SharedKernelBridge:
             return raw_response
 
     def _call_socket(self, cmd_id: str, command: str) -> dict:
-        assert self.socket_connection is not None
         conn = self.socket_connection
         request = {
             "id": cmd_id,
@@ -262,7 +396,7 @@ class SharedKernelBridge:
         self, code: str, *, eval_timeout: float | None = None
     ) -> dict | list:
         """Run a primitive that returns a JSON-serializable association/list."""
-        result = self.call(code, eval_timeout=eval_timeout)
+        result = self.call(f"(*FULLJSON*)\n{code}", eval_timeout=eval_timeout)
         if result.get("status") != "ok":
             raise BridgeError(
                 f"Bridge call returned status={result.get('status')}: "
@@ -277,22 +411,18 @@ class SharedKernelBridge:
         return payload
 
     def _read_kernel_pid(self) -> int:
-        pid_file = self.root / "kernel.pid"
-        if not pid_file.exists():
+        pid = self.socket_connection.kernel_pid
+        if pid is None:
             raise BridgeError(
-                f"No kernel.pid at {pid_file}. The bridge running in your kernel "
-                f"may pre-date the abort feature. Re-run StartSharedKernelBridge[] "
-                f"in your notebook to write it."
+                "The bridge registry record does not include a kernel PID. "
+                "Re-run StartSharedKernelBridge[] in the notebook."
             )
-        try:
-            pid = int(pid_file.read_text(encoding="utf-8").strip())
-        except ValueError as exc:
-            raise BridgeError(f"Malformed PID in {pid_file}: {exc}") from exc
         try:
             os.kill(pid, 0)  # liveness probe, no signal sent
         except ProcessLookupError as exc:
             raise BridgeError(
-                f"PID {pid} from {pid_file} is not running; kernel may have exited."
+                f"PID {pid} from the bridge registry is not running; "
+                "kernel may have exited."
             ) from exc
         except PermissionError as exc:
             raise BridgeError(
@@ -300,21 +430,15 @@ class SharedKernelBridge:
             ) from exc
         return pid
 
-    def abort_evaluation(
-        self, signal: str = "SIGINT", clear_queue: bool = False
-    ) -> dict:
+    def abort_evaluation(self, signal: str = "SIGINT") -> dict:
         """Send a POSIX signal to the kernel PID to abort the in-flight evaluation.
 
         SIGINT is what the Mathematica front-end uses for its Abort button: the
-        kernel calls Abort[] at its next polling point. SIGTERM is more forceful
-        and may cause the kernel to exit.
+        kernel aborts when it reaches an interruptible point. SIGTERM is more
+        forceful and may cause the kernel to exit.
 
         Use this only when an evaluation has hung the kernel so badly that
-        TimeConstrained / queued aborts can't reach it — the bridge poller is
-        blocked behind the in-flight eval, so any in-band approach is dead.
-
-        `clear_queue=True` deletes pending `.wl` files in the queue dir so the
-        scheduled task doesn't immediately pick up the next runaway command.
+        TimeConstrained can't reach it.
         """
         sig_num = _ABORT_SIGNALS.get(signal.upper())
         if sig_num is None:
@@ -323,20 +447,11 @@ class SharedKernelBridge:
                 f"{sorted(_ABORT_SIGNALS)}."
             )
         pid = self._read_kernel_pid()
-        cleared: list[str] = []
-        if clear_queue:
-            for queued in self.queue_dir.glob("*.wl"):
-                try:
-                    queued.unlink()
-                    cleared.append(queued.name)
-                except OSError:
-                    pass
         os.kill(pid, sig_num)
         return {
             "status": "ok",
             "pid": pid,
             "signal": signal.upper(),
-            "cleared_queue_files": cleared,
         }
 
     @staticmethod
@@ -350,11 +465,7 @@ class SharedKernelBridge:
         include_content: bool = True,
         preview_chars: int = 80,
     ) -> dict:
-        supports_compact_read = (
-            self.socket_connection is not None
-            and self.socket_connection.protocol == "jsonl-content-length-v1"
-        )
-        if include_content or not supports_compact_read:
+        if include_content:
             return self.call_for_json(f"BridgeReadNotebook[{self._wl_string(path)}]")
         include_arg = "True" if include_content else "False"
         return self.call_for_json(

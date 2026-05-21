@@ -1,6 +1,10 @@
 import pytest
 
-from mathematica_kernel_mcp.server import _validate_kernel_id
+from mathematica_kernel_mcp.backends import _integer_cell_id
+from mathematica_kernel_mcp.server import (
+    _truncate_result_input_form,
+    _validate_kernel_id,
+)
 
 
 @pytest.mark.parametrize(
@@ -18,3 +22,59 @@ def test_validate_kernel_id_accepts_safe_names(kernel_id):
 def test_validate_kernel_id_rejects_unsafe_or_reserved_names(kernel_id):
     with pytest.raises(ValueError):
         _validate_kernel_id(kernel_id)
+
+
+def test_integer_cell_id_reports_clear_error_for_invalid_strings():
+    with pytest.raises(ValueError, match="cell_id must be an integer CellID"):
+        _integer_cell_id("not-a-cell-id")
+
+    with pytest.raises(ValueError, match="anchor_cell_id must be an integer CellID"):
+        _integer_cell_id("not-a-cell-id", label="anchor_cell_id")
+
+
+def test_truncate_result_input_form_marks_long_outputs_without_mutating():
+    payload = {"status": "ok", "resultInputForm": "x" * 12}
+
+    result = _truncate_result_input_form(payload, max_chars=5)
+
+    assert result["resultInputForm"] == "xxxxx... [truncated 7 chars]"
+    assert result["resultInputFormTruncated"] is True
+    assert result["resultInputFormChars"] == 12
+    assert payload["resultInputForm"] == "x" * 12
+
+
+def test_truncate_result_input_form_recurses_into_batch_results():
+    payload = {"results": [{"resultInputForm": "abcdef"}, {"resultInputForm": "ok"}]}
+
+    result = _truncate_result_input_form(payload, max_chars=3)
+
+    assert result["results"][0]["resultInputForm"] == "abc... [truncated 3 chars]"
+    assert result["results"][0]["resultInputFormTruncated"] is True
+    assert result["results"][1]["resultInputForm"] == "ok"
+
+
+def test_truncate_result_input_form_bounds_code_messages_and_prints():
+    payload = {
+        "status": "ok",
+        "code": "c" * 9,
+        "messages": ["ok", "m" * 8],
+        "prints": ["p" * 10],
+    }
+
+    result = _truncate_result_input_form(
+        payload,
+        max_chars=4,
+        message_print_max_chars=4,
+        code_max_chars=5,
+    )
+
+    assert result["code"] == "ccccc... [truncated 4 chars]"
+    assert result["codeTruncated"] is True
+    assert result["codeChars"] == 9
+    assert result["messages"] == ["ok", "mmmm... [truncated 4 chars]"]
+    assert result["messagesTruncated"] is True
+    assert result["messagesChars"] == [2, 8]
+    assert result["prints"] == ["pppp... [truncated 6 chars]"]
+    assert result["printsTruncated"] is True
+    assert result["printsChars"] == [10]
+    assert payload["prints"] == ["p" * 10]

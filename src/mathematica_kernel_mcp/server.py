@@ -2,9 +2,8 @@
 
 Each tool dispatches at call time:
 
-- If `<file_dir>/.shared_kernel_bridge/` exists, we use the live bridge
-  (collaborative mode) — preferably via authenticated localhost socket, with
-  the legacy file queue as fallback. Edits land in the user's open notebook,
+- If a matching global bridge registry record exists, we use the live socket
+  bridge (collaborative mode). Edits land in the user's open notebook and
   kernel state is shared with them.
 - Otherwise we mutate the file on disk and run code in a kernel the MCP spawns
   itself (solo mode) — requires a locatable WolframKernel binary.
@@ -16,7 +15,7 @@ import json
 import logging
 import re as _re
 import unicodedata
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 from textwrap import dedent
 from uuid import uuid4
@@ -24,7 +23,12 @@ from uuid import uuid4
 from fastmcp import FastMCP
 
 from mathematica_kernel_mcp.backends import get_backend_for
-from mathematica_kernel_mcp.bridge import BridgeError, BridgeTimeout
+from mathematica_kernel_mcp.bridge import (
+    BridgeError,
+    BridgeTimeout,
+    bridge_registry_directories,
+    discover_bridge_records,
+)
 from mathematica_kernel_mcp.session import DEFAULT_TIMEOUT, SessionManager
 
 logger = logging.getLogger(__name__)
@@ -42,7 +46,7 @@ def _manager_factory() -> SessionManager:
 
 
 @asynccontextmanager
-async def lifespan(app):
+async def lifespan(_app):
     global _manager
     logger.info("Mathematica Kernel MCP server started")
     try:
@@ -77,6 +81,89 @@ def _backend_call(path: str, fn, *, timeout: float = 30.0) -> dict:
 def _cell_preview(content: str, max_chars: int = 80) -> str:
     flat = content.replace("\n", " ")
     return flat if len(flat) <= max_chars else flat[: max_chars - 3] + "..."
+
+
+_RESULT_INPUTFORM_MAX_CHARS = 5000
+_RESULT_MESSAGE_PRINT_MAX_CHARS = 1000
+_RESULT_CODE_MAX_CHARS = 1000
+
+
+def _truncate_text(value: str, max_chars: int) -> tuple[str, bool, int]:
+    chars = len(value)
+    if chars <= max_chars:
+        return value, False, chars
+    omitted = chars - max_chars
+    return value[:max_chars] + f"... [truncated {omitted} chars]", True, chars
+
+
+def _truncate_result_input_form(
+    payload,
+    max_chars: int = _RESULT_INPUTFORM_MAX_CHARS,
+    message_print_max_chars: int = _RESULT_MESSAGE_PRINT_MAX_CHARS,
+    code_max_chars: int = _RESULT_CODE_MAX_CHARS,
+):
+    if isinstance(payload, list):
+        return [
+            _truncate_result_input_form(
+                item,
+                max_chars,
+                message_print_max_chars,
+                code_max_chars,
+            )
+            for item in payload
+        ]
+    if not isinstance(payload, dict):
+        return payload
+
+    result = dict(payload)
+    code = result.get("code")
+    if isinstance(code, str):
+        result["code"], truncated, chars = _truncate_text(code, code_max_chars)
+        if truncated:
+            result["codeTruncated"] = True
+            result["codeChars"] = chars
+
+    raw = result.get("resultInputForm")
+    if isinstance(raw, str):
+        result["resultInputForm"], truncated, chars = _truncate_text(raw, max_chars)
+        if truncated:
+            result["resultInputFormTruncated"] = True
+            result["resultInputFormChars"] = chars
+
+    for key in ("messages", "prints"):
+        values = result.get(key)
+        if not isinstance(values, list):
+            continue
+        next_values = []
+        chars_by_item = []
+        any_truncated = False
+        for item in values:
+            if isinstance(item, str):
+                text, truncated, chars = _truncate_text(
+                    item, message_print_max_chars
+                )
+                next_values.append(text)
+                chars_by_item.append(chars)
+                any_truncated = any_truncated or truncated
+            else:
+                next_values.append(item)
+                chars_by_item.append(None)
+        result[key] = next_values
+        if any_truncated:
+            result[f"{key}Truncated"] = True
+            result[f"{key}Chars"] = chars_by_item
+
+    if isinstance(result.get("results"), list):
+        result["results"] = [
+            _truncate_result_input_form(
+                item,
+                max_chars,
+                message_print_max_chars,
+                code_max_chars,
+            )
+            for item in result["results"]
+        ]
+    return result
 
 
 _KERNEL_ID_RE = _re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")
@@ -133,11 +220,15 @@ def _kernel_eval_payload(
         timeout=_kernel_timeout(eval_timeout),
         summary_max=summary_max,
     )
-    return {
+    code_preview, code_truncated, code_chars = _truncate_text(
+        code,
+        _RESULT_CODE_MAX_CHARS,
+    )
+    payload = {
         "status": "ok",
         "kernel_id": kid,
         "owner": "agent",
-        "code": code,
+        "code": code_preview,
         "resultInputForm": result.output_summary,
         "messages": result.messages,
         "in_number": result.in_number,
@@ -148,6 +239,10 @@ def _kernel_eval_payload(
         "is_truncated": result.is_truncated,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+    if code_truncated:
+        payload["codeTruncated"] = True
+        payload["codeChars"] = code_chars
+    return payload
 
 
 def _kernel_eval_json(
@@ -183,20 +278,20 @@ mcp = FastMCP(
     instructions="""MCP server for collaborative or solo Mathematica/Wolfram Language development.
 
 ## Two modes (auto-detected per file)
-- **Collaborative**: a `.shared_kernel_bridge/` directory next to the target file
-  indicates the user has Mathematica open with the file and has evaluated
+- **Collaborative**: a matching global bridge registry record indicates the
+  user has Mathematica open with the file and has evaluated
   `<< SharedKernelMCP`` + `StartSharedKernelBridge[]`. The bridge uses an
-  authenticated localhost socket when available, falling back to the legacy
-  file queue. You drive a kernel they share with you, edits land live in their
-  open notebook, and they see your activity in real time.
+  authenticated localhost socket. You drive a kernel they share with you, edits
+  land live in their open notebook, and they see your activity in real time.
 - **Solo**: no bridge. Files are mutated on disk; code runs in a kernel the
   MCP spawns via `wolframclient`. Requires a locatable WolframKernel binary.
 
 You don't pick a mode — every `notebook_*` tool dispatches based on whether a
-bridge is present next to the file you pass in.
+bridge is present for the file you pass in. Use `bridge_list()` to inspect
+currently registered collaborative bridges.
 
 ## Cell-level workflow
-1. `notebook_read(path, include_content=False)` — get a cell index with stable IDs.
+1. `notebook_read(path, include_content=False)` — get cell metadata with opaque IDs.
 2. `notebook_search(path, pattern)` — find cells by content with line-level matches.
 3. `notebook_run_cell(path, cell_id)` — evaluate a cell. In collab the Output appears
    under it in the live notebook; in solo just returns the result.
@@ -213,7 +308,7 @@ bridge is present next to the file you pass in.
 ## Kernel state + introspection
 - `notebook_kernel_state(path, fields=...)` — memory, version, context, packages.
 - `notebook_kernel_restart(path)` — solo only; refused in collab.
-- `notebook_abort_evaluation(path, signal="SIGINT", clear_queue=False)` —
+- `notebook_abort_evaluation(path, signal="SIGINT")` —
   best-effort kernel abort when an eval is already in flight. Silent and
   headless only in solo mode on POSIX; in collab mode the GUI front-end
   surfaces a dialog the user must dismiss. Prefer `eval_timeout`.
@@ -247,8 +342,10 @@ behavior depends on mode + OS (see that tool's docstring) — in collab mode
 it surfaces a dialog the user must dismiss.
 
 `cell_id` is opaque — pass back what you got from `notebook_read` / `notebook_search`.
-In collab it's a Mathematica `CellID` (integer, stable across reorders); in solo
-it's a 1-indexed position (re-read after mutations).
+In collab it's a Mathematica `CellID` (integer, stable across reorders).
+In solo `.m`/`.wl` it is an opaque source ref that is invalidated when the file changes;
+re-read after mutations or `stale_cell_reference` responses. In solo `.nb`, it remains
+a positional compatibility ID.
 """,
     lifespan=lifespan,
 )
@@ -260,22 +357,54 @@ it's a 1-indexed position (re-read after mutations).
 
 
 @mcp.tool()
+def bridge_list(
+    include_stale: bool = False,
+    prune_stale: bool = False,
+) -> dict:
+    """List collaborative bridge registry records published by Mathematica.
+
+    This reports user-owned notebook kernels discoverable through the global
+    registry. Authentication tokens are intentionally omitted from the response.
+
+    - `include_stale=True`: also return records whose kernel PID or socket
+      metadata no longer looks alive.
+    - `prune_stale=True`: delete stale registry records while scanning.
+    """
+    try:
+        bridges = discover_bridge_records(
+            include_stale=include_stale,
+            prune_stale=prune_stale,
+        )
+    except Exception as exc:
+        return {"error": "bridge_registry_error", "message": str(exc)}
+    return {
+        "status": "ok",
+        "registry_directories": [
+            str(directory) for directory in bridge_registry_directories()
+        ],
+        "bridge_count": len(bridges),
+        "bridges": bridges,
+    }
+
+
+@mcp.tool()
 def notebook_read(
     path: str,
     include_content: bool = True,
-    cells: list[int] | None = None,
+    cells: list[int | str] | None = None,
     preview_chars: int = 80,
     timeout: float = 30.0,
 ) -> dict:
     """Read the cell layout of `path`.
 
     In collab mode this reflects the live front-end notebook (with stable CellIDs
-    injected on first read). In solo mode this parses the file on disk.
+    injected on first read). In solo mode this parses the file on disk; `.m`/`.wl`
+    cells return opaque source refs that go stale when the file changes.
 
     Filters:
     - `include_content=False`: return one-line previews instead of full content
       (cheap to scan when picking a cell).
-    - `cells=[id1, id2, ...]`: only return cells with those cellIDs.
+    - `cells=[id1, id2, ...]`: only return cells with those opaque cell IDs.
     - `preview_chars`: max chars per preview when `include_content=False`.
     """
     def _do(backend):
@@ -286,8 +415,8 @@ def notebook_read(
         )
         all_cells = result.get("cells", [])
         if cells is not None:
-            wanted = set(cells)
-            all_cells = [c for c in all_cells if c.get("cellID") in wanted]
+            wanted = {str(cell_id) for cell_id in cells}
+            all_cells = [c for c in all_cells if str(c.get("cellID")) in wanted]
         if not include_content:
             for c in all_cells:
                 c["preview"] = c.get(
@@ -391,7 +520,7 @@ def notebook_search(
 @mcp.tool()
 def notebook_run_cell(
     path: str,
-    cell_id: int,
+    cell_id: int | str,
     timeout: float = 60.0,
     eval_timeout: float | None = None,
     kernel_id: str | None = None,
@@ -406,7 +535,7 @@ def notebook_run_cell(
     but evaluated in that agent-owned scratch kernel. No visible notebook Output
     is written in this mode.
 
-    `timeout` bounds how long Python waits for the result file (bridge-side).
+    `timeout` bounds how long Python waits for the backend call to return.
     `eval_timeout` (seconds) is enforced kernel-side via TimeConstrained: when
     set, an evaluation exceeding it is aborted and returned with status="timeout".
     Use `eval_timeout` proactively when you don't trust a computation to finish.
@@ -423,18 +552,24 @@ def notebook_run_cell(
                 eval_timeout=eval_timeout,
             )
 
-        return _backend_call(path, _scratch, timeout=timeout)
+        return _backend_call(
+            path,
+            lambda backend: _truncate_result_input_form(_scratch(backend)),
+            timeout=timeout,
+        )
 
     return _backend_call(
         path,
-        lambda b: b.run_cell(path, cell_id, eval_timeout=eval_timeout),
+        lambda b: _truncate_result_input_form(
+            b.run_cell(path, cell_id, eval_timeout=eval_timeout)
+        ),
         timeout=timeout,
     )
 
 
 @mcp.tool()
 def notebook_update_cell(
-    path: str, cell_id: int, cell_type: str, content: str, timeout: float = 30.0
+    path: str, cell_id: int | str, cell_type: str, content: str, timeout: float = 30.0
 ) -> dict:
     """Rewrite the cell with the given cellID.
 
@@ -451,7 +586,7 @@ def notebook_update_cell(
 @mcp.tool()
 def notebook_insert_cell_after(
     path: str,
-    anchor_cell_id: int,
+    anchor_cell_id: int | str,
     cell_type: str,
     content: str,
     timeout: float = 30.0,
@@ -467,7 +602,7 @@ def notebook_insert_cell_after(
 @mcp.tool()
 def notebook_insert_cell_before(
     path: str,
-    anchor_cell_id: int,
+    anchor_cell_id: int | str,
     cell_type: str,
     content: str,
     timeout: float = 30.0,
@@ -481,7 +616,7 @@ def notebook_insert_cell_before(
 
 
 @mcp.tool()
-def notebook_delete_cell(path: str, cell_id: int, timeout: float = 30.0) -> dict:
+def notebook_delete_cell(path: str, cell_id: int | str, timeout: float = 30.0) -> dict:
     """Delete the cell with the given cellID (and any tagged output, in collab)."""
     return _backend_call(path, lambda b: b.delete_cell(path, cell_id), timeout=timeout)
 
@@ -530,7 +665,9 @@ def notebook_eval(
 
     return _backend_call(
         path,
-        lambda b: b.evaluate(path, code, eval_timeout=eval_timeout),
+        lambda b: _truncate_result_input_form(
+            b.evaluate(path, code, eval_timeout=eval_timeout)
+        ),
         timeout=timeout,
     )
 
@@ -538,7 +675,7 @@ def notebook_eval(
 @mcp.tool()
 def notebook_eval_inline(
     path: str,
-    anchor_cell_id: int,
+    anchor_cell_id: int | str,
     code: str,
     cell_type: str = "Code",
     timeout: float = 60.0,
@@ -555,8 +692,10 @@ def notebook_eval_inline(
     """
     return _backend_call(
         path,
-        lambda b: b.eval_inline(
-            path, anchor_cell_id, code, cell_type, eval_timeout=eval_timeout
+        lambda b: _truncate_result_input_form(
+            b.eval_inline(
+                path, anchor_cell_id, code, cell_type, eval_timeout=eval_timeout
+            )
         ),
         timeout=timeout,
     )
@@ -652,10 +791,8 @@ def _normalize_terminal_text(text: str) -> str:
         return text
     normalized = text
     if any(marker in normalized for marker in ("Ã", "â", "Î", "ï", "ð")):
-        try:
+        with suppress(UnicodeEncodeError, UnicodeDecodeError):
             normalized = normalized.encode("latin-1").decode("utf-8")
-        except (UnicodeEncodeError, UnicodeDecodeError):
-            pass
     normalized = unicodedata.normalize("NFKC", normalized)
     replacements = {
         "…": "...", "∈": " in ", "→": " -> ", "⇒": " => ",
@@ -711,7 +848,7 @@ def _normalize_context_query(context: str) -> tuple[str, str]:
     return n, f"{n}*"
 
 
-def _find_cell_payload(cells: list[dict], cell_id: int) -> dict:
+def _find_cell_payload(cells: list[dict], cell_id: int | str) -> dict:
     for c in cells:
         if c.get("cellID") == cell_id or str(c.get("cellID")) == str(cell_id):
             return c
@@ -990,7 +1127,7 @@ def kernel_get_output(
 @mcp.tool()
 def notebook_run_cells(
     path: str,
-    cells: list[int] | None = None,
+    cells: list[int | str] | None = None,
     start: int | None = None,
     end: int | None = None,
     all: bool = False,
@@ -1002,7 +1139,7 @@ def notebook_run_cells(
     """Run multiple cells in order in a single MCP call.
 
     Cell selection (one of):
-    - `cells=[id1, id2, ...]`: explicit cellIDs (in the order to run).
+    - `cells=[id1, id2, ...]`: explicit opaque cell IDs (in the order to run).
     - `start` / `end`: 1-indexed positions in the read order (inclusive).
     - `all=True`: run every executable (Input/Code) cell.
 
@@ -1024,11 +1161,11 @@ def notebook_run_cells(
             if start is not None or end is not None:
                 raise ValueError("Use either `cells=[...]` or `start`/`end`, not both")
             wanted = list(cells)
-            by_id = {c.get("cellID"): c for c in all_cells}
-            missing = [cid for cid in wanted if cid not in by_id]
+            by_id = {str(c.get("cellID")): c for c in all_cells}
+            missing = [cid for cid in wanted if str(cid) not in by_id]
             if missing:
                 raise ValueError(f"cellID(s) not found: {missing}")
-            selected = [by_id[cid] for cid in wanted]
+            selected = [by_id[str(cid)] for cid in wanted]
         elif start is not None or end is not None:
             lo = start if start is not None else 1
             hi = end if end is not None else len(all_cells)
@@ -1078,7 +1215,7 @@ def notebook_run_cells(
                     "visible_output": False,
                 }
             )
-        return payload
+        return _truncate_result_input_form(payload)
 
     return _backend_call(path, _do, timeout=timeout)
 
@@ -1087,7 +1224,6 @@ def notebook_run_cells(
 def notebook_abort_evaluation(
     path: str,
     signal: str = "SIGINT",
-    clear_queue: bool = False,
     timeout: float = 10.0,
 ) -> dict:
     """Signal the kernel to abort its current evaluation. Best-effort, not
@@ -1095,11 +1231,11 @@ def notebook_abort_evaluation(
 
     Prefer `eval_timeout` on the call you're about to make — that's the
     headless cross-platform mechanism. Use `notebook_abort_evaluation` only
-    when an eval is already in flight and the queued bridge can't reach it.
+    when an eval is already in flight and the socket bridge can't reach it.
 
     Behavior depends on mode and OS:
     - **Solo mode, POSIX (Linux/macOS):** SIGINT is silent — the kernel calls
-      `Abort[]` at its next polling point. Headless.
+      `Abort[]` when it reaches an interruptible point. Headless.
     - **Solo mode, Windows:** POSIX signal semantics differ; this is not
       reliable. Use `eval_timeout` instead.
     - **Collab mode, any OS:** signals the user's kernel, but the GUI front-end
@@ -1109,13 +1245,11 @@ def notebook_abort_evaluation(
     SIGTERM is available but more forceful and may cause the kernel to exit;
     only use it if SIGINT didn't work and you're prepared to lose kernel state.
 
-    `clear_queue=True` deletes pending `.wl` files in the bridge queue so the
-    scheduled task doesn't immediately pick up the next runaway (collab only).
     """
     def _do(backend):
         return {
             "mode": backend.mode,
-            **backend.abort_evaluation(signal=signal, clear_queue=clear_queue),
+            **backend.abort_evaluation(signal=signal),
         }
 
     return _backend_call(path, _do, timeout=timeout)

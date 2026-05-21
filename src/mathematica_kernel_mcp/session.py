@@ -5,14 +5,13 @@ import os
 import signal as _signal
 import shutil
 import threading
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from pathlib import Path
+from contextlib import suppress
+from dataclasses import dataclass
 
 from wolframclient.evaluation import WolframLanguageSession
 from wolframclient.language import wlexpr
 
-from mathematica_kernel_mcp.models import CellRuntimeInfo, EvalResult, SessionInfo
+from mathematica_kernel_mcp.models import EvalResult, SessionInfo
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +43,6 @@ class ManagedSession:
     session: WolframLanguageSession
     is_busy: bool = False
     out_count: int = 0
-    cell_runs: dict[tuple[str, str], CellRuntimeInfo] = field(default_factory=dict)
     pid: int | None = None
 
 
@@ -78,9 +76,6 @@ class SessionManager:
             session = WolframLanguageSession()
         session.set_parameter("STARTUP_TIMEOUT", self._startup_timeout)
         return session
-
-    def _cell_run_key(self, file_path: str, cell_id: str) -> tuple[str, str]:
-        return (str(Path(file_path).resolve()), cell_id)
 
     def start(self) -> None:
         """Start the session manager and create the main session."""
@@ -148,10 +143,8 @@ class SessionManager:
             result = []
             for managed in self._sessions.values():
                 alive = False
-                try:
+                with suppress(Exception):
                     alive = managed.session.started
-                except Exception:
-                    pass
                 result.append(
                     SessionInfo(
                         name=managed.name,
@@ -277,7 +270,6 @@ class SessionManager:
         managed.session.stop()
         managed.session.start()
         managed.out_count = 0
-        managed.cell_runs.clear()
         try:
             managed.pid = int(managed.session.evaluate(wlexpr("$ProcessID")))
         except Exception:
@@ -301,60 +293,3 @@ class SessionManager:
             )
         os.kill(managed.pid, sig_num)
         return managed.pid
-
-    def record_cell_run(
-        self,
-        file_path: str,
-        cell_id: str,
-        result: EvalResult,
-        session_name: str = "main",
-    ) -> CellRuntimeInfo:
-        """Persist per-session runtime metadata for a file/cell pair."""
-        managed = self.get_session(session_name)
-        runtime = CellRuntimeInfo(
-            last_in=result.in_number,
-            last_out=result.out_number,
-            messages=list(result.messages),
-            last_run_at=datetime.now(timezone.utc).isoformat(),
-        )
-        managed.cell_runs[self._cell_run_key(file_path, cell_id)] = runtime
-        return runtime
-
-    def get_cell_run_info(
-        self,
-        file_path: str,
-        cell_id: str,
-        session_name: str = "main",
-    ) -> CellRuntimeInfo:
-        """Return the last recorded run metadata for a file/cell pair."""
-        managed = self.get_session(session_name)
-        runtime = managed.cell_runs.get(self._cell_run_key(file_path, cell_id))
-        if runtime is None:
-            return CellRuntimeInfo()
-        return CellRuntimeInfo(
-            last_in=runtime.last_in,
-            last_out=runtime.last_out,
-            messages=list(runtime.messages),
-            last_run_at=runtime.last_run_at,
-        )
-
-    def clear_cell_run_info(
-        self,
-        file_path: str,
-        cell_id: str,
-        session_name: str | None = None,
-    ) -> None:
-        """Clear persisted run metadata for a file/cell pair.
-
-        When `session_name` is omitted, the metadata is cleared in every session
-        because the source content has changed globally.
-        """
-        key = self._cell_run_key(file_path, cell_id)
-        if session_name is not None:
-            managed = self.get_session(session_name)
-            managed.cell_runs.pop(key, None)
-            return
-
-        with self._lock:
-            for managed in self._sessions.values():
-                managed.cell_runs.pop(key, None)

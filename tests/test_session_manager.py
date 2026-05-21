@@ -9,8 +9,8 @@ class FakeSession:
         self.started = False
         self.stopped = False
 
-    def set_parameter(self, name, value):
-        pass
+    def set_parameter(self, _name, _value):
+        return None
 
     def start(self):
         self.started = True
@@ -19,7 +19,7 @@ class FakeSession:
         self.stopped = True
         self.started = False
 
-    def evaluate(self, expr):
+    def evaluate(self, _expr):
         return self.pid
 
 

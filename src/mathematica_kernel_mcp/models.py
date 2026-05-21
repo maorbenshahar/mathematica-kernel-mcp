@@ -4,26 +4,15 @@ from dataclasses import dataclass, field
 
 
 @dataclass
-class CellRuntimeInfo:
-    """Runtime metadata for a cell in a specific kernel session."""
-
-    last_in: int | None = None
-    last_out: int | None = None
-    messages: list[str] = field(default_factory=list)
-    last_run_at: str | None = None
-
-
-@dataclass
 class Cell:
     """A single cell parsed from a .m or .nb file."""
 
     number: int  # 1-indexed position in file
-    cell_id: str  # stable identifier for mutation and run tracking
+    cell_id: str  # opaque cell reference; source refs are not persisted to .m/.wl
     cell_type: str  # "Title", "Section", "Text", "Input", "Code", etc.
     content: str  # the actual code or text
     line_start: int  # line number in source file
     line_end: int  # line number in source file
-    runtime: CellRuntimeInfo = field(default_factory=CellRuntimeInfo)
 
 
 @dataclass

@@ -3,7 +3,12 @@
 from textwrap import dedent
 from pathlib import Path
 
-from mathematica_kernel_mcp.parser import create_m_cell, parse_m_file
+from mathematica_kernel_mcp.parser import (
+    StaleCellReferenceError,
+    create_m_cell,
+    parse_m_file,
+    update_m_cell,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -52,12 +57,14 @@ def test_parse_m_file_cell_numbering():
     assert numbers == list(range(1, 10))
 
 
-def test_parse_m_file_assigns_fallback_cell_ids():
+def test_parse_m_file_returns_source_refs():
     cells = parse_m_file(FIXTURES / "sample.m")
-    assert [cell.cell_id for cell in cells] == [f"cell-{index:04d}" for index in range(1, 10)]
+
+    assert all(cell.cell_id.startswith("src:v1:") for cell in cells)
+    assert len({cell.cell_id for cell in cells}) == len(cells)
 
 
-def test_parse_m_file_reads_explicit_cell_ids(tmp_path):
+def test_parse_m_file_ignores_legacy_explicit_cell_ids(tmp_path):
     path = tmp_path / "with_ids.m"
     path.write_text(
         dedent(
@@ -72,11 +79,11 @@ def test_parse_m_file_reads_explicit_cell_ids(tmp_path):
     )
 
     cells = parse_m_file(path)
-    assert [cell.cell_id for cell in cells] == ["setup", "note"]
-    assert cells[1].content == "hello"
+    assert [cell.content for cell in cells] == ["x = 5", "hello"]
+    assert all(cell.cell_id.startswith("src:v1:") for cell in cells)
 
 
-def test_create_m_cell_persists_stable_ids_for_legacy_files(tmp_path):
+def test_create_m_cell_does_not_persist_cell_ids(tmp_path):
     path = tmp_path / "mutable.m"
     path.write_text(
         dedent(
@@ -93,10 +100,9 @@ def test_create_m_cell_persists_stable_ids_for_legacy_files(tmp_path):
     created = create_m_cell(path, "Input", "x + 1", after_cell=1)
     cells = parse_m_file(path)
 
-    assert created.cell_id.startswith("cell-")
-    assert created.cell_id not in {"cell-0001", "cell-0002"}
-    assert [cell.cell_id for cell in cells] == ["cell-0001", created.cell_id, "cell-0002"]
-    assert "[cell_id=cell-0001]" in path.read_text()
+    assert created.cell_id.startswith("src:v1:")
+    assert [cell.content for cell in cells] == ["x = 5", "x + 1", "x^2"]
+    assert "[cell_id=" not in path.read_text()
 
 
 def test_parse_m_file_falls_back_for_unmarked_scripts(tmp_path):
@@ -119,7 +125,7 @@ def test_parse_m_file_falls_back_for_unmarked_scripts(tmp_path):
 
     assert [cell.cell_type for cell in cells] == ["Input", "Input", "Text"]
     assert [cell.content for cell in cells] == ["x = 1", "y = x + 1", "helper note"]
-    assert [cell.cell_id for cell in cells] == ["cell-0001", "cell-0002", "cell-0003"]
+    assert all(cell.cell_id.startswith("src:v1:") for cell in cells)
 
 
 def test_create_m_cell_bootstraps_markerless_file_into_mutable_cells(tmp_path):
@@ -139,8 +145,8 @@ def test_create_m_cell_bootstraps_markerless_file_into_mutable_cells(tmp_path):
     cells = parse_m_file(path)
 
     assert [cell.content for cell in cells] == ["x = 1", "y = x + 1", "y^2"]
-    assert created.cell_id.startswith("cell-")
-    assert "[cell_id=cell-0001]" in path.read_text()
+    assert created.cell_id.startswith("src:v1:")
+    assert "[cell_id=" not in path.read_text()
 
 
 def test_parse_m_file_empty():
@@ -151,3 +157,53 @@ def test_parse_m_file_empty():
         f.flush()
         cells = parse_m_file(f.name)
     assert cells == []
+
+def test_update_m_cell_accepts_current_source_ref(tmp_path):
+    path = tmp_path / "mutable.m"
+    path.write_text(
+        dedent(
+            """\
+            (* ::Input:: *)
+            x = 5
+
+            (* ::Input:: *)
+            x^2
+            """
+        )
+    )
+    ref = parse_m_file(path)[1].cell_id
+
+    updated = update_m_cell(path, cell_id=ref, content="x^3")
+
+    assert updated.content == "x^3"
+    assert [cell.content for cell in parse_m_file(path)] == ["x = 5", "x^3"]
+    assert "[cell_id=" not in path.read_text()
+
+
+def test_update_m_cell_rejects_stale_source_ref(tmp_path):
+    path = tmp_path / "mutable.m"
+    path.write_text(
+        dedent(
+            """\
+            (* ::Input:: *)
+            x = 5
+
+            (* ::Input:: *)
+            x^2
+            """
+        )
+    )
+    ref = parse_m_file(path)[1].cell_id
+    path.write_text("(* changed outside MCP *)\\n" + path.read_text())
+
+    try:
+        update_m_cell(path, cell_id=ref, content="x^3")
+    except StaleCellReferenceError as exc:
+        payload = exc.to_payload()
+    else:
+        raise AssertionError("expected StaleCellReferenceError")
+
+    assert payload["status"] == "stale_cell_reference"
+    assert payload["cellID"] == ref
+    assert "expectedFileHash" in payload
+    assert "currentFileHash" in payload
