@@ -1,4 +1,9 @@
-"""Parse .m, .wl, and .nb files into unified Cell models."""
+"""Parse .m and .wl package files into unified Cell models.
+
+`.nb` files are not handled here — they go through the live shared kernel
+bridge (collab mode) for both reads and mutations. The solo dispatcher
+refuses `.nb`.
+"""
 
 from __future__ import annotations
 
@@ -295,70 +300,14 @@ def parse_m_file(path: str | Path) -> list[Cell]:
     return _assign_source_refs(cells, file_hash)
 
 
-def parse_nb_file(path: str | Path) -> list[Cell]:
-    """Parse a .nb (Mathematica notebook) file into cells.
-
-    Notebooks are Mathematica expressions (not XML). We extract Cell[...]
-    expressions and their types.
-    """
-    path = Path(path)
-    text = path.read_text()
-
-    cells: list[Cell] = []
-    cell_count = 0
-
-    # .nb files contain Cell[content, "CellType", ...] expressions.
-    # This is a simple fallback parser; live/solo kernel paths use richer APIs.
-    cell_pattern = re.compile(
-        r'Cell\[([^]]*(?:\[[^]]*\])*[^]]*),\s*"(\w+)"',
-        re.MULTILINE,
-    )
-
-    for match in cell_pattern.finditer(text):
-        cell_count += 1
-        raw_content = match.group(1)
-        cell_type = match.group(2)
-
-        content = _extract_cell_content(raw_content)
-        line_start = text[:match.start()].count("\n") + 1
-        line_end = text[:match.end()].count("\n") + 1
-
-        cells.append(
-            Cell(
-                number=cell_count,
-                cell_id=f"cell-{cell_count:04d}",
-                cell_type=cell_type,
-                content=content,
-                line_start=line_start,
-                line_end=line_end,
-            )
-        )
-
-    return cells
-
-
-def _extract_cell_content(raw: str) -> str:
-    """Best-effort extraction of readable content from .nb cell data."""
-    string_match = re.match(r'^"(.*)"$', raw.strip(), re.DOTALL)
-    if string_match:
-        return string_match.group(1)
-
-    strings = re.findall(r'"([^"]*)"', raw)
-    if strings:
-        return "".join(strings)
-
-    return raw.strip()
-
-
 def parse_file(path: str | Path) -> list[Cell]:
-    """Parse a .m, .wl, or .nb file into cells, choosing parser by extension."""
+    """Parse a .m or .wl file into cells. `.nb` is not handled here; in collab
+    mode it goes through the bridge, and solo mode does not support `.nb`."""
     path = Path(path)
     ext = path.suffix.lower()
     if ext in {".m", ".wl"}:
         return parse_m_file(path)
-    if ext == ".nb":
-        return parse_nb_file(path)
-    raise ValueError(f"Unsupported file extension: {ext}. Expected .m, .wl, or .nb")
+    raise ValueError(f"Unsupported file extension: {ext}. Expected .m or .wl")
 
 
 def resolve_m_cell(

@@ -307,23 +307,24 @@ currently registered collaborative bridges.
 
 ## Kernel state + introspection
 - `notebook_kernel_state(path, fields=...)` — memory, version, context, packages.
-- `notebook_kernel_restart(path)` — solo only; refused in collab.
 - `notebook_abort_evaluation(path, signal="SIGINT")` —
   best-effort kernel abort when an eval is already in flight. Silent and
   headless only in solo mode on POSIX; in collab mode the GUI front-end
-  surfaces a dialog the user must dismiss. Prefer `eval_timeout`.
+  surfaces a dialog the user must dismiss. Prefer `eval_timeout`. To restart
+  an agent-owned scratch kernel, call `kernel_restart(kernel_id)`.
 - `notebook_symbol_info(path, name, fields=...)` — usage, definition, attributes,
   options, context, *Values, messages.
 - `notebook_documentation_search(path, query)` — ranked WL doc matches.
-- `notebook_names(path, pattern)` — `Names[pattern]` symbol list.
-- `notebook_list_symbols(path, context="Global`")` — symbols by context.
+- `notebook_list_symbols(path, context="Global`")` — symbols by context or
+  `Names` pattern (`"Plot*"`, `"*Integrate*"`).
 - `notebook_get_output(path, out_number, view="full"|"short"|"summary")` —
-  inspect a previous `Out[n]` (full / shallow / metadata).
+  inspect a previous `Out[n]` from the file's collab/solo kernel. For scratch
+  kernels, use `kernel_get_output(kernel_id, out_number, ...)` instead.
 
 ## Agent-owned scratch kernels
 - `kernel_create(kernel_id?)`, `kernel_list`, `kernel_eval`, `kernel_eval_json`,
-  `kernel_state`, `kernel_restart`, `kernel_abort`, `kernel_close`, and
-  `kernel_get_output` manage explicit agent-owned kernels. Use these for probes
+  `kernel_state`, `kernel_get_output`, `kernel_restart`, `kernel_abort`, and
+  `kernel_close` manage explicit agent-owned kernels. Use these for probes
   that should not pollute the user's shared notebook kernel.
 - `notebook_eval(..., kernel_id=...)`, `notebook_run_cell(..., kernel_id=...)`,
   and `notebook_run_cells(..., kernel_id=...)` route evaluation into the named
@@ -343,9 +344,9 @@ it surfaces a dialog the user must dismiss.
 
 `cell_id` is opaque — pass back what you got from `notebook_read` / `notebook_search`.
 In collab it's a Mathematica `CellID` (integer, stable across reorders).
-In solo `.m`/`.wl` it is an opaque source ref that is invalidated when the file changes;
-re-read after mutations or `stale_cell_reference` responses. In solo `.nb`, it remains
-a positional compatibility ID.
+In solo `.m`/`.wl` it is an opaque source ref that is invalidated when the file
+changes; re-read after mutations or `stale_cell_reference` responses. `.nb`
+files require collab mode — solo mode refuses them.
 """,
     lifespan=lifespan,
 )
@@ -787,6 +788,13 @@ _TEXT_HELPERS_WL = dedent(
 
 
 def _normalize_terminal_text(text: str) -> str:
+    """Guard against mojibake / NFKC issues in doc/usage strings.
+
+    The kernel-side `normalizeDisplayText` handles the bulk of Wolfram-
+    specific replacements (\\[Ellipsis], \\[Rule], etc.). This is a thin
+    safety net for transport-layer encoding glitches and lingering
+    compatibility-form codepoints.
+    """
     if not isinstance(text, str):
         return text
     normalized = text
@@ -794,14 +802,6 @@ def _normalize_terminal_text(text: str) -> str:
         with suppress(UnicodeEncodeError, UnicodeDecodeError):
             normalized = normalized.encode("latin-1").decode("utf-8")
     normalized = unicodedata.normalize("NFKC", normalized)
-    replacements = {
-        "…": "...", "∈": " in ", "→": " -> ", "⇒": " => ",
-        "≤": " <= ", "≥": " >= ", "∞": "Infinity",
-    }
-    for old, new in replacements.items():
-        normalized = normalized.replace(old, new)
-    normalized = _re.sub(r"[ \t]+\n", "\n", normalized)
-    normalized = _re.sub(r"\n{3,}", "\n\n", normalized)
     return normalized.strip()
 
 
@@ -1071,7 +1071,12 @@ def kernel_get_output(
     max_chars: int = 2000,
     depth: int = 3,
 ) -> dict:
-    """Inspect a previous result stored by `kernel_eval` in an agent-owned kernel."""
+    """Inspect a previous result stored by `kernel_eval` in a scratch kernel.
+
+    `view` mirrors `notebook_get_output`: "full" returns InputForm (truncated at
+    `max_chars`), "short" returns `Shallow` at `depth`, and "summary" returns
+    head / leaf_count / depth / byte_count / dimensions.
+    """
     def _do():
         if view not in _GET_OUTPUT_VIEWS:
             raise ValueError(
@@ -1285,16 +1290,6 @@ def notebook_kernel_state(
 
 
 @mcp.tool()
-def notebook_kernel_restart(path: str, timeout: float = 30.0) -> dict:
-    """Restart the kernel.
-
-    In collab mode this is refused (the kernel is the user's; we won't clobber
-    it). In solo mode it restarts the MCP-spawned kernel, clearing all defs.
-    """
-    return _backend_call(path, lambda b: b.kernel_restart(), timeout=timeout)
-
-
-@mcp.tool()
 def notebook_symbol_info(
     path: str,
     name: str,
@@ -1499,21 +1494,14 @@ def notebook_documentation_search(
 
 
 @mcp.tool()
-def notebook_names(path: str, pattern: str, timeout: float = 30.0) -> dict:
-    """Return all symbol names matching a pattern (e.g., "Plot*", "*Integrate*")."""
-    expr = f"Names[{_wl_string(pattern)}]"
-    return _backend_call(
-        path,
-        lambda b: {"pattern": pattern, "matches": b.evaluate_for_json(expr)},
-        timeout=timeout,
-    )
-
-
-@mcp.tool()
 def notebook_list_symbols(
     path: str, context: str = "Global`", timeout: float = 30.0
 ) -> dict:
-    """List symbols for a context (e.g., 'Global`') or a Names pattern."""
+    """List symbols for a context (e.g., 'Global`') or a `Names` pattern.
+
+    Accepts either a context name like 'Global`' (auto-expanded to 'Global`*')
+    or a literal Names pattern such as 'Plot*' or '*Integrate*'.
+    """
     try:
         normalized, pattern = _normalize_context_query(context)
     except ValueError as exc:
@@ -1538,26 +1526,18 @@ def notebook_get_output(
     max_chars: int = 2000,
     depth: int = 3,
     timeout: float = 30.0,
-    kernel_id: str | None = None,
 ) -> dict:
-    """Inspect a previous evaluation's `Out[n]` value.
+    """Inspect a previous evaluation's `Out[n]` value in the file's collab/solo kernel.
 
     `view`:
     - `"full"`: full InputForm string (truncated at `max_chars`).
     - `"short"`: `Shallow` rendering at `depth` (truncated at `max_chars`).
     - `"summary"`: structured `<|head, leaf_count, depth, byte_count, dimensions|>`.
 
-    If `kernel_id` is provided, this inspects the agent-owned kernel's stored
-    `kernel_eval` output instead of the file/notebook backend.
+    For results stored in a scratch kernel by `kernel_eval`, use
+    `kernel_get_output(kernel_id, out_number, view=...)` — it has the same
+    `view` semantics but no path.
     """
-    if kernel_id is not None:
-        return kernel_get_output(
-            kernel_id=kernel_id,
-            out_number=out_number,
-            view=view,
-            max_chars=max_chars,
-            depth=depth,
-        )
 
     if view not in _GET_OUTPUT_VIEWS:
         return {"error": f"Unsupported view '{view}'. Use one of: {sorted(_GET_OUTPUT_VIEWS)}"}

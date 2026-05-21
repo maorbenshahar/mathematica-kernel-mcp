@@ -76,9 +76,9 @@ Remove it with `UninstallSharedKernelMCPAutostart[]`.
   `notebook_run_cells` (batch), `notebook_update_cell`,
   `notebook_insert_cell_after`/`_before`, `notebook_delete_cell`,
   `notebook_eval`, `notebook_eval_inline`, `notebook_sweep_outputs`.
-- **State + introspection**: `notebook_kernel_state`, `notebook_kernel_restart`,
+- **State + introspection**: `notebook_kernel_state`,
   `notebook_abort_evaluation`, `notebook_symbol_info`,
-  `notebook_documentation_search`, `notebook_names`, `notebook_list_symbols`,
+  `notebook_documentation_search`, `notebook_list_symbols`,
   `notebook_get_output`.
 - **Agent-owned scratch kernels**: `kernel_create`, `kernel_list`,
   `kernel_eval`, `kernel_eval_json`, `kernel_state`, `kernel_get_output`,
@@ -94,8 +94,7 @@ still reading notebook cell contents from the target file.
 `notebook_search`. In collab it is a native Mathematica `CellID` where the
 front end provides one. In solo `.m`/`.wl` mode it is a source ref derived
 from the current file content; if the file changes before a mutation, the MCP
-returns `stale_cell_reference` and you should re-read. Solo `.nb` keeps a
-positional compatibility ID.
+returns `stale_cell_reference` and you should re-read.
 
 `StartSharedKernelBridge[]` starts a localhost socket bridge. Socket responses
 are UTF-8 JSON with `Content-Length` framing, so large notebook reads do not
@@ -155,8 +154,8 @@ depends on mode + OS:
 
 ## Known Limitations
 
-- Solo `.nb` support is more conservative than live collab mode; prefer collab
-  for native notebook workflows.
+- `.nb` files require collab mode (open the notebook in Mathematica and run
+  `StartSharedKernelBridge[]`). Solo mode handles `.m`/`.wl` only.
 - Graphics currently return textual summaries/InputForm. Rich graphics export is
   planned separately.
 

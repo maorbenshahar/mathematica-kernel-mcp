@@ -1,4 +1,4 @@
-"""Tests for .m and .nb file parsing."""
+"""Tests for .m / .wl package-file parsing."""
 
 from textwrap import dedent
 from pathlib import Path

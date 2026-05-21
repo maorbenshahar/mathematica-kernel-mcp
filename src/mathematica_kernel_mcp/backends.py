@@ -6,9 +6,10 @@ based on whether a shared-kernel bridge is present:
 - `BridgeBackend` (collaborative): the user has Mathematica open with the file +
   `StartSharedKernelBridge[...]` evaluated. We talk to the user's kernel via the
   authenticated socket bridge; edits land live in their open notebook; kernel
-  state is shared.
-- `SoloBackend` (solo): no bridge. We mutate the `.m`/`.nb` file on disk and run
+  state is shared. Works for both `.m`/`.wl` and `.nb` files.
+- `SoloBackend` (solo): no bridge. We mutate the `.m`/`.wl` file on disk and run
   code in a kernel the MCP spawns via wolframclient. The user is not involved.
+  `.nb` files require collab mode; the dispatcher refuses them in solo.
 
 A `get_backend_for(path)` dispatcher picks the right backend based on whether
 a matching bridge exists in the global bridge registry.
@@ -19,15 +20,9 @@ from __future__ import annotations
 import json
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
+from pathlib import Path
 
-from .bridge import SharedKernelBridge, bridge_record_for_file
-from .notebook import (
-    create_nb_cell,
-    delete_nb_cell,
-    is_notebook_path,
-    parse_nb_file_with_kernel,
-    update_nb_cell,
-)
+from .bridge import BridgeError, SharedKernelBridge, bridge_record_for_file
 from .parser import (
     StaleCellReferenceError,
     create_m_cell,
@@ -36,6 +31,13 @@ from .parser import (
     resolve_m_cell,
     update_m_cell,
 )
+
+
+_NOTEBOOK_EXTENSION = ".nb"
+
+
+def _is_notebook_path(path: str) -> bool:
+    return Path(path).suffix.lower() == _NOTEBOOK_EXTENSION
 
 
 class Backend(ABC):
@@ -99,11 +101,6 @@ class Backend(ABC):
         ...
 
     @abstractmethod
-    def kernel_restart(self) -> dict:
-        """Restart the underlying kernel; collab mode refuses this."""
-        ...
-
-    @abstractmethod
     def abort_evaluation(self, signal: str = "SIGINT") -> dict:
         """Signal the underlying kernel to abort its current evaluation."""
         ...
@@ -119,7 +116,7 @@ def _integer_cell_id(value, *, label: str = "cell_id") -> int:
         return int(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(
-            f"{label} must be an integer CellID in collab/.nb mode, or a "
+            f"{label} must be an integer CellID in collab mode, or a "
             "source ref returned by notebook_read for solo .m/.wl files"
         ) from exc
 
@@ -209,16 +206,6 @@ class BridgeBackend(Backend):
     def evaluate_for_json(self, code):
         return self.bridge.call_for_json(code)
 
-    def kernel_restart(self) -> dict:
-        return {
-            "status": "refused",
-            "reason": "collab_mode_kernel_owned_by_user",
-            "message": (
-                "Cannot restart the user's shared kernel from the MCP — that would "
-                "clobber their session. Ask the user to Quit Kernel themselves if needed."
-            ),
-        }
-
     def abort_evaluation(self, signal: str = "SIGINT") -> dict:
         return self.bridge.abort_evaluation(signal=signal)
 
@@ -264,26 +251,6 @@ class SoloBackend(Backend):
         # manager: SessionManager (lazy-started by the caller)
         self.manager = manager
 
-    def _source_refs_for(self, path: str) -> bool:
-        return not is_notebook_path(path)
-
-    def _parse(self, path: str):
-        if is_notebook_path(path):
-            return parse_nb_file_with_kernel(path, self.manager)
-        return parse_file(path)
-
-    def _resolve_position(self, cells, cell_id):
-        cid = int(cell_id)
-        for c in cells:
-            if c.number == cid:
-                return c
-        raise ValueError(f"cell {cid} not found (file has {len(cells)} cells)")
-
-    def _resolve(self, path: str, cell_id):
-        if is_notebook_path(path):
-            return self._resolve_position(self._parse(path), cell_id)
-        return resolve_m_cell(path, **_cell_selector(cell_id))
-
     def read(
         self,
         path,
@@ -291,9 +258,8 @@ class SoloBackend(Backend):
         include_content: bool = True,
         preview_chars: int = 80,
     ):
-        cells = self._parse(path)
-        source_refs = self._source_refs_for(path)
-        payload_cells = [_cell_to_payload(c, source_refs=source_refs) for c in cells]
+        cells = parse_file(path)
+        payload_cells = [_cell_to_payload(c, source_refs=True) for c in cells]
         if not include_content:
             for c in payload_cells:
                 flat = c.get("content", "").replace("\n", " ")
@@ -311,14 +277,14 @@ class SoloBackend(Backend):
 
     def run_cell(self, path, cell_id, eval_timeout: float | None = None):
         try:
-            cell = self._resolve(path, cell_id)
+            cell = resolve_m_cell(path, **_cell_selector(cell_id))
         except StaleCellReferenceError as exc:
             return _stale_reference_payload(exc)
 
         if cell.cell_type not in {"Input", "Code"}:
             return {
                 "status": "skipped",
-                "cellID": cell.cell_id if self._source_refs_for(path) else cell.number,
+                "cellID": cell.cell_id,
                 "index": cell.number,
                 "reason": "not_executable",
                 "cellType": cell.cell_type,
@@ -327,7 +293,7 @@ class SoloBackend(Backend):
         result = self.manager.evaluate(cell.content, **kwargs)
         return {
             "status": "ok",
-            "cellID": cell.cell_id if self._source_refs_for(path) else cell.number,
+            "cellID": cell.cell_id,
             "index": cell.number,
             "resultInputForm": result.output_summary,
             "messages": result.messages,
@@ -339,100 +305,66 @@ class SoloBackend(Backend):
             "is_truncated": result.is_truncated,
         }
 
-    def _mutating_helpers(self, path):
-        if is_notebook_path(path):
-            return create_nb_cell, update_nb_cell, delete_nb_cell, True
-        return create_m_cell, update_m_cell, delete_m_cell, False
-
     def update_cell(self, path, cell_id, cell_type, content):
-        _, update, _, is_nb = self._mutating_helpers(path)
         try:
-            if is_nb:
-                new_cell = update(
-                    path, self.manager, cell_number=int(cell_id),
-                    content=content, cell_type=cell_type,
-                )
-                returned_id = new_cell.number
-            else:
-                new_cell = update(
-                    path,
-                    **_cell_selector(cell_id),
-                    content=content,
-                    cell_type=cell_type,
-                )
-                returned_id = new_cell.cell_id
-        except StaleCellReferenceError as exc:
-            return _stale_reference_payload(exc)
-        return {"status": "ok", "cellID": returned_id, "cellType": new_cell.cell_type}
-
-    def insert_cell_after(self, path, anchor_cell_id, cell_type, content):
-        create, _, _, is_nb = self._mutating_helpers(path)
-        try:
-            if is_nb:
-                new_cell = create(
-                    path, self.manager, cell_type, content,
-                    after_cell=int(anchor_cell_id),
-                )
-                new_id = new_cell.number
-            else:
-                selector = _cell_selector(anchor_cell_id)
-                new_cell = create(
-                    path,
-                    cell_type,
-                    content,
-                    after_cell=selector.get("cell_number"),
-                    after_cell_id=selector.get("cell_id"),
-                )
-                new_id = new_cell.cell_id
+            new_cell = update_m_cell(
+                path,
+                **_cell_selector(cell_id),
+                content=content,
+                cell_type=cell_type,
+            )
         except StaleCellReferenceError as exc:
             return _stale_reference_payload(exc)
         return {
             "status": "ok",
-            "newCellID": new_id,
+            "cellID": new_cell.cell_id,
+            "cellType": new_cell.cell_type,
+        }
+
+    def insert_cell_after(self, path, anchor_cell_id, cell_type, content):
+        selector = _cell_selector(anchor_cell_id)
+        try:
+            new_cell = create_m_cell(
+                path,
+                cell_type,
+                content,
+                after_cell=selector.get("cell_number"),
+                after_cell_id=selector.get("cell_id"),
+            )
+        except StaleCellReferenceError as exc:
+            return _stale_reference_payload(exc)
+        return {
+            "status": "ok",
+            "newCellID": new_cell.cell_id,
             "anchorCellID": anchor_cell_id,
             "position": "After",
         }
 
     def insert_cell_before(self, path, anchor_cell_id, cell_type, content):
-        create, _, _, is_nb = self._mutating_helpers(path)
+        selector = _cell_selector(anchor_cell_id)
         try:
-            if is_nb:
-                new_cell = create(
-                    path, self.manager, cell_type, content,
-                    before_cell=int(anchor_cell_id),
-                )
-                new_id = new_cell.number
-            else:
-                selector = _cell_selector(anchor_cell_id)
-                new_cell = create(
-                    path,
-                    cell_type,
-                    content,
-                    before_cell=selector.get("cell_number"),
-                    before_cell_id=selector.get("cell_id"),
-                )
-                new_id = new_cell.cell_id
+            new_cell = create_m_cell(
+                path,
+                cell_type,
+                content,
+                before_cell=selector.get("cell_number"),
+                before_cell_id=selector.get("cell_id"),
+            )
         except StaleCellReferenceError as exc:
             return _stale_reference_payload(exc)
         return {
             "status": "ok",
-            "newCellID": new_id,
+            "newCellID": new_cell.cell_id,
             "anchorCellID": anchor_cell_id,
             "position": "Before",
         }
 
     def delete_cell(self, path, cell_id):
-        _, _, delete, is_nb = self._mutating_helpers(path)
         try:
-            if is_nb:
-                removed = delete(path, self.manager, cell_number=int(cell_id))
-                removed_id = removed.number
-            else:
-                removed = delete(path, **_cell_selector(cell_id))
-                removed_id = removed.cell_id
+            removed = delete_m_cell(path, **_cell_selector(cell_id))
         except StaleCellReferenceError as exc:
             return _stale_reference_payload(exc)
-        return {"status": "ok", "deletedCellID": removed_id}
+        return {"status": "ok", "deletedCellID": removed.cell_id}
 
     def evaluate(self, _path, code, eval_timeout: float | None = None):
         kwargs = {"timeout": int(eval_timeout)} if eval_timeout else {}
@@ -453,7 +385,7 @@ class SoloBackend(Backend):
         self, path, anchor_cell_id, code, cell_type="Code",
         eval_timeout: float | None = None,
     ):
-        # Insert + run + return. The Input cell is persisted in the file (.m/.nb).
+        # Insert + run + return. The Input cell is persisted in the .m/.wl file.
         ins = self.insert_cell_after(path, anchor_cell_id, cell_type, code)
         new_id = ins.get("newCellID")
         if new_id is None:
@@ -468,18 +400,12 @@ class SoloBackend(Backend):
         }
 
     def sweep_outputs(self, _path):
-        # No-op in solo mode: .m files don't persist Output cells; .nb files
-        # could in principle, but cleanup is the user's call there. Treat as a
-        # success that did nothing rather than failing.
+        # No-op in solo mode: .m/.wl files don't persist Output cells.
         return {"status": "ok", "swept_count": 0, "note": "solo mode no-op"}
 
     def evaluate_for_json(self, code):
         raw = self.manager.evaluate_raw(f'ExportString[({code}), "RawJSON"]')
         return json.loads(raw)
-
-    def kernel_restart(self) -> dict:
-        self.manager.restart_session("main")
-        return {"status": "ok", "restarted": "main"}
 
     def abort_evaluation(self, signal: str = "SIGINT") -> dict:
         pid = self.manager.abort_session("main", signal=signal)
@@ -505,7 +431,17 @@ def get_backend_for(path: str, manager_factory, timeout: float = 30.0) -> Backen
     `manager_factory` is a zero-arg callable that returns a SessionManager. It's
     only invoked when solo mode is selected, so collab-mode usage doesn't pay
     the cost of spawning a kernel.
+
+    Raises `BridgeError` for a `.nb` file with no live bridge: solo mode
+    cannot mutate `.nb` files; open the notebook in Mathematica and run
+    `StartSharedKernelBridge[]`.
     """
     if has_bridge_for(path):
         return BridgeBackend(path, timeout=timeout)
+    if _is_notebook_path(path):
+        raise BridgeError(
+            f".nb files require collab mode. No live shared kernel bridge is "
+            f"registered for {path!s}. Open the notebook in Mathematica and "
+            "run `StartSharedKernelBridge[]`."
+        )
     return SoloBackend(manager_factory())

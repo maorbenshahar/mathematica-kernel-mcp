@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 
 @dataclass
 class Cell:
-    """A single cell parsed from a .m or .nb file."""
+    """A single cell parsed from a .m or .wl package file."""
 
     number: int  # 1-indexed position in file
     cell_id: str  # opaque cell reference; source refs are not persisted to .m/.wl
@@ -36,8 +36,5 @@ class SessionInfo:
     name: str
     is_alive: bool
     is_busy: bool
-    kernel_version: str = ""
-    memory_used: int = 0  # bytes
-    loaded_packages: list[str] = field(default_factory=list)
     out_count: int = 0  # number of Out[] entries
     pid: int | None = None
