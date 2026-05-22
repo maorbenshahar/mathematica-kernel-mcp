@@ -446,14 +446,31 @@ evaluateBridgeCommand[commandId_String, code_String, state_Association] := Modul
     x_ /; ! (NumericQ[x] && x > 0) -> Null
   ];
 
+  (* EvaluationData captures messages as formatted text (e.g.
+     "ToExpression::sntxi : Incomplete expression; more input is needed.")
+     rather than bare HoldForm[Symbol::tag] references. $Messages = {} keeps
+     messages from being printed to the notebook / stderr; EvaluationData
+     uses its own capture path so the response envelope still gets them. *)
   Block[
     {
       $Context = "Global`",
       $ContextPath = DeleteDuplicates @ Join[{"System`", "Global`"}, $ContextPath],
-      $MessageList = {}
+      $Messages = {}
     },
-    held = Quiet @ Check[ToExpression[code, InputForm, HoldComplete], $Failed];
-    parseMessages = stringify /@ $MessageList;
+    Module[{data},
+      data = EvaluationData[
+        Check[ToExpression[code, InputForm, HoldComplete], $Failed]
+      ];
+      held = data["Result"];
+      parseMessages = data["MessagesText"]
+    ]
+  ];
+
+  If[held =!= $Failed,
+    (* Newline-separated multi-statement input parses to a multi-arg
+       HoldComplete[a, b, c]; rewrap so ReleaseHold evaluates them as a
+       single CompoundExpression and returns the last value. *)
+    held = Replace[held, HoldComplete[args___] :> HoldComplete[CompoundExpression[args]]]
   ];
 
   If[held === $Failed,
@@ -483,17 +500,18 @@ evaluateBridgeCommand[commandId_String, code_String, state_Association] := Modul
       {
         $Context = "Global`",
         $ContextPath = DeleteDuplicates @ Join[{"System`", "Global`"}, $ContextPath],
-        $MessageList = {},
         $Messages = If[silent, {}, $Messages],
         Print = printFunction
       },
-      With[{evaluated = If[
-          NumericQ[evalTimeout],
-          TimeConstrained[ReleaseHold[held], evalTimeout, timeoutTag],
-          ReleaseHold[held]
-        ]},
-        messages = stringify /@ $MessageList;
-        evaluated
+      Module[{data},
+        data = EvaluationData[
+          If[NumericQ[evalTimeout],
+            TimeConstrained[ReleaseHold[held], evalTimeout, timeoutTag],
+            ReleaseHold[held]
+          ]
+        ];
+        messages = data["MessagesText"];
+        data["Result"]
       ]
     ],
     status = "aborted";
@@ -540,14 +558,24 @@ socketErrorResponse[id_, status_String, message_String] := <|
 |>;
 
 socketWriteResponse[source_, response_String] := Module[
-  {bodyBytes, header, packetBytes},
-  bodyBytes = StringToByteArray[response, "UTF-8"];
-  header = StringJoin[
-    "Content-Length: ", ToString[Length[bodyBytes]], "\r\n",
-    "Content-Type: application/json; charset=utf-8\r\n",
-    "\r\n"
+  {bodyBytes, headerBytes, packetBytes},
+  (* response is the output of ExportString[..., "RawJSON"], which packs
+     UTF-8 bytes into a WL String as char codes 0-255 (e.g. "é" appears as
+     chars 195, 169 — the UTF-8 bytes of the codepoint, not codepoint 233).
+     Encoding that with "UTF-8" again would double-encode and produce
+     mojibake on the wire. "ISO8859-1" maps chars 0-255 straight to bytes
+     0-255, preserving the already-encoded UTF-8 payload exactly. The header
+     stays ASCII, so its encoding doesn't matter. *)
+  bodyBytes = StringToByteArray[response, "ISO8859-1"];
+  headerBytes = StringToByteArray[
+    StringJoin[
+      "Content-Length: ", ToString[Length[bodyBytes]], "\r\n",
+      "Content-Type: application/json; charset=utf-8\r\n",
+      "\r\n"
+    ],
+    "ASCII"
   ];
-  packetBytes = StringToByteArray[header <> response, "UTF-8"];
+  packetBytes = Join[headerBytes, bodyBytes];
   Quiet @ Check[
     Scan[
       (BinaryWrite[source, ByteArray[#]]; Flush[source]) &,
@@ -902,12 +930,24 @@ BridgeRunCell[path_String, cellID_Integer, evalTimeout_:Null] := Module[
 
   content = cellInputCode[target];
 
-  Block[{$MessageList = {}},
-    parseHeld = Quiet @ Check[
-      ToExpression[content, InputForm, HoldComplete],
-      $Failed
-    ];
-    parseMessages = stringify /@ $MessageList;
+  (* EvaluationData captures messages as readable text; $Messages = {} keeps
+     them out of the notebook so the agent-side capture is the only consumer. *)
+  Block[{$Messages = {}},
+    Module[{data},
+      data = EvaluationData[
+        Check[ToExpression[content, InputForm, HoldComplete], $Failed]
+      ];
+      parseHeld = data["Result"];
+      parseMessages = data["MessagesText"]
+    ]
+  ];
+  If[parseHeld =!= $Failed,
+    (* Newline-separated multi-statement cell content parses to a multi-arg
+       HoldComplete; rewrap into one CompoundExpression. *)
+    parseHeld = Replace[
+      parseHeld,
+      HoldComplete[args___] :> HoldComplete[CompoundExpression[args]]
+    ]
   ];
   If[parseHeld === $Failed,
     Return[<|
@@ -930,16 +970,17 @@ BridgeRunCell[path_String, cellID_Integer, evalTimeout_:Null] := Module[
       {
         $Context = "Global`",
         $ContextPath = DeleteDuplicates @ Join[{"System`", "Global`"}, $ContextPath],
-        $MessageList = {},
         Print = printFunction
       },
-      With[{evaluated = If[
-          NumericQ[effectiveTimeout],
-          TimeConstrained[ReleaseHold[parseHeld], effectiveTimeout, timeoutTag],
-          ReleaseHold[parseHeld]
-        ]},
-        messages = stringify /@ $MessageList;
-        evaluated
+      Module[{data},
+        data = EvaluationData[
+          If[NumericQ[effectiveTimeout],
+            TimeConstrained[ReleaseHold[parseHeld], effectiveTimeout, timeoutTag],
+            ReleaseHold[parseHeld]
+          ]
+        ];
+        messages = data["MessagesText"];
+        data["Result"]
       ]
     ],
     status = "aborted"; $Aborted

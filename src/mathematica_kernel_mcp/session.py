@@ -185,13 +185,25 @@ class SessionManager:
             # Evaluate in a single Module so parse / timeout / ok are
             # distinguished by a sentinel returned alongside the value.
             # `wolfram$mcp$out[n]` is set so kernel_get_output can retrieve it.
-            code_literal = json.dumps(code)
+            # ensure_ascii=False so Unicode chars pass through as themselves;
+            # the default \uXXXX form is not valid WL string escape syntax.
+            code_literal = json.dumps(code, ensure_ascii=False)
             store_code = dedent(
                 f"""
                 Module[{{wolfram$mcp$held, wolfram$mcp$timeoutTag, wolfram$mcp$eval}},
                     wolfram$mcp$held = Check[
                         ToExpression[{code_literal}, InputForm, HoldComplete],
                         $Failed
+                    ];
+                    If[wolfram$mcp$held =!= $Failed,
+                        (* ToExpression on newline-separated input yields a
+                           multi-arg HoldComplete[a, b, c]; wrap into one
+                           CompoundExpression so ReleaseHold evaluates left to
+                           right and returns the last value. *)
+                        wolfram$mcp$held = Replace[
+                            wolfram$mcp$held,
+                            HoldComplete[args___] :> HoldComplete[CompoundExpression[args]]
+                        ]
                     ];
                     If[wolfram$mcp$held === $Failed,
                         wolfram$mcp$out[{out_number}] = $Failed;

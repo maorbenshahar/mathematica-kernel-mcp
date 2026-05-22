@@ -156,3 +156,61 @@ def test_evaluate_does_not_misclassify_legitimate_aborted_result(monkeypatch):
 
     assert result.status == "ok"
     assert result.head == "Symbol"
+
+
+def test_evaluate_wraps_multi_arg_holdcomplete_into_compound_expression(monkeypatch):
+    """Regression: ToExpression on newline-separated multi-statement input
+    yields HoldComplete[a, b, c] (multi-arg) instead of one CompoundExpression.
+    Without the Replace step, the eval would assign Sequence[Null, Null, last]
+    and downstream meta/int calls would choke. We assert the WL sent to the
+    kernel includes the Replace fix."""
+    manager = SessionManager()
+    captured: list = []
+
+    class CapturingSession(FakeSession):
+        def evaluate_wrap(self, expr):
+            captured.append(str(expr))
+            return FakeWrap("ok")
+
+        def evaluate(self, _expr):
+            return ["1", "Integer", 0, 1]
+
+    monkeypatch.setattr(
+        manager, "_create_kernel_session", lambda: CapturingSession(5555)
+    )
+
+    manager.evaluate("f[x_]:=x; f[1]")
+
+    assert captured, "evaluate_wrap was never called"
+    wl = captured[0]
+    assert "HoldComplete[args___]" in wl
+    assert "HoldComplete[CompoundExpression[args]]" in wl
+
+
+def test_evaluate_passes_unicode_code_without_uXXXX_escapes(monkeypatch):
+    """Regression: json.dumps defaults to ensure_ascii=True, emitting \\uXXXX
+    escapes that WL's string parser rejects with 'Unknown string escape \\u'.
+    Code paths must use ensure_ascii=False so Unicode chars pass through."""
+    manager = SessionManager()
+    captured: list = []
+
+    class CapturingSession(FakeSession):
+        def evaluate_wrap(self, expr):
+            captured.append(str(expr))
+            return FakeWrap("ok")
+
+        def evaluate(self, _expr):
+            return ["1", "Integer", 0, 1]
+
+    monkeypatch.setattr(
+        manager, "_create_kernel_session", lambda: CapturingSession(7777)
+    )
+
+    manager.evaluate('"héllo → ∞"')
+
+    assert captured, "evaluate_wrap was never called"
+    wl = captured[0]
+    # Unicode chars must appear literally, not as \uXXXX escapes.
+    assert "héllo → ∞" in wl
+    assert "\\u00e9" not in wl
+    assert "\\u2192" not in wl

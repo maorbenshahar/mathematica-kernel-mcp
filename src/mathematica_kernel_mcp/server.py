@@ -251,15 +251,85 @@ def _kernel_eval_json(
     code: str,
     *,
     eval_timeout: float | None = None,
-):
+) -> dict:
+    """Evaluate WL and return a JSON envelope: {status, value?}.
+
+    Pre-parses with ToExpression+HoldComplete so a syntax-broken `code`
+    surfaces as status="parse_error" rather than as a malformed JSON read.
+    Uses a kernel-local sentinel tag for timeout so user code returning the
+    literal symbol $Aborted is not mislabeled (matches SessionManager.evaluate).
+
+    Envelope shape:
+        {"status": "ok", "value": <decoded JSON>}
+        {"status": "parse_error"}
+        {"status": "timeout"}
+    """
     kid = _validate_kernel_id(kernel_id)
     timeout = _kernel_timeout(eval_timeout)
-    expr = f"TimeConstrained[({code}), {timeout}, $Aborted]"
-    raw = manager.evaluate_raw(
-        f'ExportString[({expr}), "RawJSON"]',
-        session_name=kid,
+    # ensure_ascii=False so Unicode chars pass through as themselves;
+    # the default \\uXXXX form is not valid WL string escape syntax.
+    code_literal = json.dumps(code, ensure_ascii=False)
+    wl = dedent(
+        f"""
+        Module[
+            {{
+                wolfram$mcp$held,
+                wolfram$mcp$timeoutTag,
+                wolfram$mcp$eval,
+                wolfram$mcp$json
+            }},
+            wolfram$mcp$held = Check[
+                ToExpression[{code_literal}, InputForm, HoldComplete],
+                $Failed
+            ];
+            If[wolfram$mcp$held =!= $Failed,
+                wolfram$mcp$held = Replace[
+                    wolfram$mcp$held,
+                    HoldComplete[args___] :> HoldComplete[CompoundExpression[args]]
+                ]
+            ];
+            If[wolfram$mcp$held === $Failed,
+                ExportString[<|"status" -> "parse_error"|>, "RawJSON"],
+                wolfram$mcp$eval = TimeConstrained[
+                    ReleaseHold[wolfram$mcp$held],
+                    {timeout},
+                    wolfram$mcp$timeoutTag
+                ];
+                If[wolfram$mcp$eval === wolfram$mcp$timeoutTag,
+                    ExportString[<|"status" -> "timeout"|>, "RawJSON"],
+                    wolfram$mcp$json = Quiet @ Check[
+                        ExportString[
+                            <|"status" -> "ok", "value" -> wolfram$mcp$eval|>,
+                            "RawJSON"
+                        ],
+                        $Failed
+                    ];
+                    If[StringQ[wolfram$mcp$json],
+                        wolfram$mcp$json,
+                        ExportString[
+                            <|
+                                "status" -> "not_json_encodable",
+                                "head" -> ToString[Head[wolfram$mcp$eval]],
+                                "inputForm" -> StringTake[
+                                    ToString[wolfram$mcp$eval, InputForm],
+                                    UpTo[2000]
+                                ]
+                            |>,
+                            "RawJSON"
+                        ]
+                    ]
+                ]
+            ]
+        ]
+        """
     )
-    return json.loads(raw)
+    raw = manager.evaluate_raw(wl, session_name=kid)
+    envelope = json.loads(_utf8_recode(raw))
+    if not isinstance(envelope, dict) or "status" not in envelope:
+        raise ValueError(
+            f"kernel_eval_json: unexpected envelope shape {envelope!r}"
+        )
+    return envelope
 
 
 def _kernel_call(fn) -> dict:
@@ -326,10 +396,10 @@ currently registered collaborative bridges.
   `kernel_state`, `kernel_get_output`, `kernel_restart`, `kernel_abort`, and
   `kernel_close` manage explicit agent-owned kernels. Use these for probes
   that should not pollute the user's shared notebook kernel.
-- `notebook_eval(..., kernel_id=...)`, `notebook_run_cell(..., kernel_id=...)`,
-  and `notebook_run_cells(..., kernel_id=...)` route evaluation into the named
-  scratch kernel while still reading notebook cell contents from the selected
-  file/notebook. No visible notebook Output is written in this mode.
+- `notebook_run_cell(..., kernel_id=...)` and `notebook_run_cells(..., kernel_id=...)`
+  read cell content from the file but evaluate it in the named scratch kernel
+  (no visible notebook Output). For path-free scratch probes, call
+  `kernel_eval(kernel_id, code)` directly.
 
 ## Bounding evaluation time
 The run-style tools (`notebook_run_cell`, `notebook_run_cells`, `notebook_eval`,
@@ -634,36 +704,16 @@ def notebook_eval(
     code: str,
     timeout: float = 60.0,
     eval_timeout: float | None = None,
-    kernel_id: str | None = None,
 ) -> dict:
-    """Evaluate WL code SILENTLY (no notebook trace).
+    """Evaluate WL code SILENTLY in the file's collab/solo kernel.
 
-    Use for LLM-internal probes. The result envelope has status, resultInputForm,
-    messages, etc. Use `notebook_eval_inline` instead when the user should see
-    the input + output.
+    No notebook trace — use for LLM-internal probes that should share the
+    user's shared kernel state. For scratch probes that should not touch the
+    user's kernel, call `kernel_eval(kernel_id, code)` directly.
 
-    If `kernel_id` is provided, evaluation goes to that explicit agent-owned
-    kernel instead of the file's collab/solo backend. This is the safest route
-    for scratch probes that should not alter the user's shared notebook kernel.
-
-    `eval_timeout` (seconds) wraps the eval in TimeConstrained kernel-side; on
-    expiry, status="timeout".
+    `eval_timeout` (seconds) wraps the eval in TimeConstrained kernel-side;
+    on expiry, status="timeout". On a parse error, status="parse_error".
     """
-    if kernel_id is not None:
-        return _kernel_call(
-            lambda: {
-                **_kernel_eval_payload(
-                    _manager_factory(),
-                    kernel_id,
-                    code,
-                    eval_timeout=eval_timeout,
-                ),
-                "path": path,
-                "mode": "scratch",
-                "visible_output": False,
-            }
-        )
-
     return _backend_call(
         path,
         lambda b: _truncate_result_input_form(
@@ -807,6 +857,22 @@ def _normalize_terminal_text(text: str) -> str:
 
 def _wl_string(value: str) -> str:
     return json.dumps(value)
+
+
+def _utf8_recode(raw: str) -> str:
+    """Recover proper Unicode from a wolframclient-delivered RawJSON string.
+
+    `ExportString[..., "RawJSON"]` returns a WL String whose codes are the
+    UTF-8 byte values of the encoded JSON (e.g. for `"é"` the kernel returns a
+    String with codes 195, 169 instead of 233). wolframclient delivers that as
+    a Python `str` containing those bytes-as-chars, so an `encode("latin-1") +
+    decode("utf-8")` round-trip recovers the original Unicode. ASCII-only
+    output round-trips unchanged.
+    """
+    try:
+        return raw.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return raw
 
 
 def _wl_string_list(values: list[str]) -> str:
@@ -1017,19 +1083,35 @@ def kernel_eval_json(
     code: str,
     eval_timeout: float | None = None,
 ) -> dict:
-    """Evaluate WL code in an agent-owned kernel and return RawJSON-decoded output."""
-    return _kernel_call(
-        lambda: {
-            "status": "ok",
-            "kernel_id": _validate_kernel_id(kernel_id),
-            "result": _kernel_eval_json(
-                _manager_factory(),
-                kernel_id,
-                code,
-                eval_timeout=eval_timeout,
-            ),
-        }
-    )
+    """Evaluate WL code in an agent-owned kernel and return RawJSON-decoded output.
+
+    Possible `status` values:
+    - `"ok"` — response carries `result` (the decoded JSON value).
+    - `"parse_error"` — the WL code did not parse.
+    - `"timeout"` — evaluation exceeded `eval_timeout` (or the default).
+    - `"not_json_encodable"` — the evaluated value (e.g. a `Symbol`,
+      `Graphics`, pure function) has no JSON representation. Response carries
+      `head` and `inputForm` (truncated) so you can see what came back; if
+      you only need a textual summary, call `kernel_eval` instead.
+    """
+    def _do():
+        kid = _validate_kernel_id(kernel_id)
+        envelope = _kernel_eval_json(
+            _manager_factory(),
+            kernel_id,
+            code,
+            eval_timeout=eval_timeout,
+        )
+        status = envelope["status"]
+        payload: dict = {"status": status, "kernel_id": kid}
+        if status == "ok":
+            payload["result"] = envelope.get("value")
+        elif status == "not_json_encodable":
+            payload["head"] = envelope.get("head")
+            payload["inputForm"] = envelope.get("inputForm")
+        return payload
+
+    return _kernel_call(_do)
 
 
 @mcp.tool()
@@ -1054,10 +1136,11 @@ def kernel_state(
             f'"{name}" -> {_KERNEL_STATE_FIELDS[name]}' for name in wanted
         )
         expr = f"<|{selected_exprs}|>"
+        envelope = _kernel_eval_json(manager, kid, expr)
         return {
             "status": "ok",
             "kernel_id": kid,
-            "state": _kernel_eval_json(manager, kid, expr),
+            "state": envelope.get("value"),
         }
 
     return _kernel_call(_do)
@@ -1099,12 +1182,13 @@ def kernel_get_output(
                 ]
                 """
             )
+            envelope = _kernel_eval_json(manager, kid, expr)
             return {
                 "status": "ok",
                 "kernel_id": kid,
                 "out_number": out_number,
                 "view": view,
-                "summary": _kernel_eval_json(manager, kid, expr),
+                "summary": envelope.get("value"),
             }
         if view == "full":
             wl = f"ToString[{ref}, InputForm]"

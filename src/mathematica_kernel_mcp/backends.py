@@ -405,6 +405,13 @@ class SoloBackend(Backend):
 
     def evaluate_for_json(self, code):
         raw = self.manager.evaluate_raw(f'ExportString[({code}), "RawJSON"]')
+        # ExportString[..., "RawJSON"] returns a WL String whose codes are the
+        # UTF-8 bytes of the encoded JSON; recode so non-ASCII content comes
+        # back as proper Unicode rather than as bytes-as-chars.
+        try:
+            raw = raw.encode("latin-1").decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            pass
         return json.loads(raw)
 
     def abort_evaluation(self, signal: str = "SIGINT") -> dict:
