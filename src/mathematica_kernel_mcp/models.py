@@ -27,6 +27,7 @@ class EvalResult:
     is_truncated: bool = False  # whether summary is truncated
     in_number: int = 0  # the In[n] reference in the kernel
     out_number: int = 0  # the Out[n] reference in the kernel
+    status: str = "ok"  # "ok" | "parse_error" | "timeout"
 
 
 @dataclass

@@ -1,5 +1,6 @@
 """Session manager for persistent Wolfram Language kernel sessions."""
 
+import json
 import logging
 import os
 import signal as _signal
@@ -7,6 +8,7 @@ import shutil
 import threading
 from contextlib import suppress
 from dataclasses import dataclass
+from textwrap import dedent
 
 from wolframclient.evaluation import WolframLanguageSession
 from wolframclient.language import wlexpr
@@ -165,8 +167,13 @@ class SessionManager:
     ) -> EvalResult:
         """Evaluate code in a named session, return a summarized result.
 
-        Uses TimeConstrained inside the kernel (not wolframclient timeout)
-        to avoid killing the kernel on timeout.
+        Distinguishes parse_error, timeout, and ok cases:
+        - Pre-parses with `ToExpression[..., HoldComplete]`; `$Failed` =>
+          status="parse_error" (matches the bridge path's semantics).
+        - Runs the parsed expression under `TimeConstrained[..., timeout, tag]`
+          with a unique sentinel tag; matching the tag => status="timeout".
+          (Avoids the old `str(result) == "$Aborted"` heuristic that would
+          mislabel user code legitimately returning `$Aborted`.)
         """
         managed = self.get_session(session_name)
         managed.is_busy = True
@@ -175,19 +182,39 @@ class SessionManager:
             in_number = managed.out_count
             out_number = managed.out_count
 
-            # Evaluate and store result in one expression.
-            # Uses TimeConstrained for safe timeout (doesn't kill kernel).
-            # Stores result in wolfram$mcp$out[n] for later retrieval.
-            store_code = (
-                f"wolfram$mcp$out[{out_number}] = "
-                f"TimeConstrained[({code}), {timeout}]"
+            # Evaluate in a single Module so parse / timeout / ok are
+            # distinguished by a sentinel returned alongside the value.
+            # `wolfram$mcp$out[n]` is set so kernel_get_output can retrieve it.
+            code_literal = json.dumps(code)
+            store_code = dedent(
+                f"""
+                Module[{{wolfram$mcp$held, wolfram$mcp$timeoutTag, wolfram$mcp$eval}},
+                    wolfram$mcp$held = Check[
+                        ToExpression[{code_literal}, InputForm, HoldComplete],
+                        $Failed
+                    ];
+                    If[wolfram$mcp$held === $Failed,
+                        wolfram$mcp$out[{out_number}] = $Failed;
+                        "parse_error",
+                        wolfram$mcp$eval = TimeConstrained[
+                            ReleaseHold[wolfram$mcp$held],
+                            {timeout},
+                            wolfram$mcp$timeoutTag
+                        ];
+                        If[wolfram$mcp$eval === wolfram$mcp$timeoutTag,
+                            wolfram$mcp$out[{out_number}] = $Aborted;
+                            "timeout",
+                            wolfram$mcp$out[{out_number}] = wolfram$mcp$eval;
+                            "ok"
+                        ]
+                    ]
+                ]
+                """
             )
 
-            # evaluate_wrap gives us messages separately
             raw = managed.session.evaluate_wrap(wlexpr(store_code))
 
-            # Extract messages
-            messages = []
+            messages: list[str] = []
             if hasattr(raw, "messages") and raw.messages:
                 for msg in raw.messages:
                     if isinstance(msg, tuple) and len(msg) >= 2:
@@ -195,10 +222,27 @@ class SessionManager:
                     else:
                         messages.append(str(msg))
 
-            # Check for timeout
-            result = raw.result if hasattr(raw, "result") else raw
-            result_str = str(result)
-            if result_str == "$Aborted":
+            status_value = raw.result if hasattr(raw, "result") else raw
+            status = str(status_value)
+            if status not in {"ok", "parse_error", "timeout"}:
+                # Unexpected — surface as parse_error with the raw status so
+                # callers can see what happened.
+                messages.insert(0, f"Unexpected eval status: {status!r}")
+                status = "parse_error"
+
+            if status == "parse_error":
+                return EvalResult(
+                    output_summary="$Failed (parse error)",
+                    head="$Failed",
+                    byte_size=0,
+                    leaf_count=0,
+                    messages=messages,
+                    is_truncated=False,
+                    in_number=in_number,
+                    out_number=out_number,
+                    status="parse_error",
+                )
+            if status == "timeout":
                 return EvalResult(
                     output_summary="$Aborted (timed out)",
                     head="$Aborted",
@@ -208,31 +252,32 @@ class SessionManager:
                     is_truncated=False,
                     in_number=in_number,
                     out_number=out_number,
+                    status="timeout",
                 )
 
-            # Get metadata about the result from the kernel
-            meta_code = f"""
-            With[{{res = wolfram$mcp$out[{out_number}]}},
-                {{
-                    If[
-                        AtomQ[res],
-                        ToString[res, InputForm],
-                        ToString[Shallow[res, {{5, 3}}], OutputForm]
-                    ],
-                    ToString[Head[res]],
-                    ByteCount[res],
-                    LeafCount[res]
-                }}
-            ]
-            """
+            meta_code = dedent(
+                f"""
+                With[{{res = wolfram$mcp$out[{out_number}]}},
+                    {{
+                        If[
+                            AtomQ[res],
+                            ToString[res, InputForm],
+                            ToString[Shallow[res, {{5, 3}}], OutputForm]
+                        ],
+                        ToString[Head[res]],
+                        ByteCount[res],
+                        LeafCount[res]
+                    }}
+                ]
+                """
+            )
             meta = managed.session.evaluate(wlexpr(meta_code))
 
-            summary = str(meta[0]) if meta else result_str
+            summary = str(meta[0]) if meta else ""
             head = str(meta[1]) if meta else "Unknown"
             byte_size = int(meta[2]) if meta else 0
             leaf_count = int(meta[3]) if meta else 0
 
-            # Truncate summary if needed
             is_truncated = len(summary) > summary_max
             if is_truncated:
                 summary = summary[:summary_max] + "..."
@@ -246,6 +291,7 @@ class SessionManager:
                 is_truncated=is_truncated,
                 in_number=in_number,
                 out_number=out_number,
+                status="ok",
             )
         finally:
             managed.is_busy = False

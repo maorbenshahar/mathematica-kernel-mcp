@@ -292,7 +292,7 @@ class SoloBackend(Backend):
         kwargs = {"timeout": int(eval_timeout)} if eval_timeout else {}
         result = self.manager.evaluate(cell.content, **kwargs)
         return {
-            "status": "ok",
+            "status": result.status,
             "cellID": cell.cell_id,
             "index": cell.number,
             "resultInputForm": result.output_summary,
@@ -370,7 +370,7 @@ class SoloBackend(Backend):
         kwargs = {"timeout": int(eval_timeout)} if eval_timeout else {}
         result = self.manager.evaluate(code, **kwargs)
         return {
-            "status": "ok",
+            "status": result.status,
             "code": code,
             "resultInputForm": result.output_summary,
             "messages": result.messages,

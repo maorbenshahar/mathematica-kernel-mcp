@@ -32,3 +32,19 @@ def test_evaluate_bridge_command_owns_silent_message_suppression():
 
     assert "silent = StringStartsQ" in body
     assert "$Messages = If[silent, {}, $Messages]" in body
+
+
+def test_autostart_pre_clears_itself_after_successful_attach():
+    """Regression: the autostart $Pre hook must Unset itself once
+    StartSharedKernelBridge reports Running -> True, otherwise the wrapper
+    runs on every user evaluation forever and can collide with anything else
+    the user assigns to $Pre."""
+    source = INIT_M.read_text()
+    start = source.index("autostartBlock[")
+    end = source.index("\nstringify[", start)
+    block = source[start:end]
+
+    # The hook must consult the bridge's return value before declaring success.
+    assert 'Lookup[status, \\"Running\\", False]' in block
+    # And then remove itself.
+    assert "Unset[$Pre]" in block

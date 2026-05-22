@@ -225,7 +225,7 @@ def _kernel_eval_payload(
         _RESULT_CODE_MAX_CHARS,
     )
     payload = {
-        "status": "ok",
+        "status": result.status,
         "kernel_id": kid,
         "owner": "agent",
         "code": code_preview,

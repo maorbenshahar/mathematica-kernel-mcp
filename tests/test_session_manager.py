@@ -23,6 +23,38 @@ class FakeSession:
         return self.pid
 
 
+class FakeWrap:
+    def __init__(self, result, messages=()):
+        self.result = result
+        self.messages = list(messages)
+
+
+def _install_evaluating_session(monkeypatch, *, status_value, messages=(), meta=None):
+    """Install a manager whose 'main' session returns a stubbed eval result.
+
+    `status_value` is what `evaluate_wrap` returns as the status sentinel.
+    `meta` is the list returned by the secondary `evaluate(meta_code)` call
+    when status is "ok".
+    """
+    manager = SessionManager()
+
+    class StubSession(FakeSession):
+        def __init__(self, pid):
+            super().__init__(pid)
+            self.evaluate_wrap_calls: list = []
+
+        def evaluate_wrap(self, expr):
+            self.evaluate_wrap_calls.append(expr)
+            return FakeWrap(status_value, messages)
+
+        def evaluate(self, expr):
+            self.last_meta_expr = expr
+            return meta if meta is not None else self.pid
+
+    monkeypatch.setattr(manager, "_create_kernel_session", lambda: StubSession(4242))
+    return manager
+
+
 def test_create_scratch_does_not_start_main(monkeypatch):
     manager = SessionManager()
     sessions: list[FakeSession] = []
@@ -67,3 +99,60 @@ def test_missing_non_main_session_is_not_created(monkeypatch):
         manager.get_session("missing")
 
     assert manager.list_sessions() == []
+
+
+def test_evaluate_returns_parse_error_status_when_kernel_reports_it(monkeypatch):
+    manager = _install_evaluating_session(
+        monkeypatch,
+        status_value="parse_error",
+        messages=[("Message", "Invalid syntax in or before Sqrt[")],
+    )
+
+    result = manager.evaluate("Sqrt[")
+
+    assert result.status == "parse_error"
+    assert result.head == "$Failed"
+    assert result.output_summary.startswith("$Failed")
+    assert any("Invalid syntax" in m for m in result.messages)
+
+
+def test_evaluate_returns_timeout_status_when_kernel_reports_it(monkeypatch):
+    manager = _install_evaluating_session(monkeypatch, status_value="timeout")
+
+    result = manager.evaluate("Pause[10]")
+
+    assert result.status == "timeout"
+    assert result.head == "$Aborted"
+    assert "timed out" in result.output_summary
+
+
+def test_evaluate_returns_ok_status_for_normal_eval(monkeypatch):
+    manager = _install_evaluating_session(
+        monkeypatch,
+        status_value="ok",
+        meta=["4", "Integer", 16, 1],
+    )
+
+    result = manager.evaluate("2+2")
+
+    assert result.status == "ok"
+    assert result.output_summary == "4"
+    assert result.head == "Integer"
+    assert result.byte_size == 16
+    assert result.leaf_count == 1
+
+
+def test_evaluate_does_not_misclassify_legitimate_aborted_result(monkeypatch):
+    """Regression: user code returning the literal symbol `$Aborted` must
+    surface as status='ok', not 'timeout' (the old string-compare heuristic
+    would mis-label it)."""
+    manager = _install_evaluating_session(
+        monkeypatch,
+        status_value="ok",
+        meta=["$Aborted", "Symbol", 8, 1],
+    )
+
+    result = manager.evaluate("$Aborted")
+
+    assert result.status == "ok"
+    assert result.head == "Symbol"
