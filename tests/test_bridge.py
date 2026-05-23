@@ -96,7 +96,12 @@ def test_socket_call_sends_authenticated_json_line():
     assert result["status"] == "ok"
     assert result["resultJSON"] == 2
     assert received["request"]["token"] == "secret"
-    assert received["request"]["code"] == "(*SILENT*)\n1+1"
+    # Protocol v3: code is the raw user input; silent/eval_timeout/full_json
+    # come as structured JSON fields, not as comment-marker injection.
+    assert received["request"]["code"] == "1+1"
+    assert received["request"]["silent"] is True
+    assert "eval_timeout" not in received["request"] or received["request"]["eval_timeout"] is None
+    assert received["request"]["full_json"] is False
 
 
 def test_socket_call_supports_unframed_response():
@@ -166,7 +171,8 @@ def test_compact_read_uses_preview_bridge_signature():
     bridge.read_notebook("/tmp/test.nb", include_content=False, preview_chars=17)
 
     thread.join(timeout=5)
-    assert "(*FULLJSON*)" in received["request"]["code"]
+    # Protocol v3: full_json is now a structured field, not a comment marker.
+    assert received["request"]["full_json"] is True
     assert 'BridgeReadNotebook["/tmp/test.nb", False, 17]' in received["request"]["code"]
 
 

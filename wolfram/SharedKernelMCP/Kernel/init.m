@@ -56,6 +56,16 @@ BridgeSweepStaleOutputs::usage =
   "BridgeSweepStaleOutputs[path] removes Output cells tagged BridgeOutputFor:<n> whose anchor \
 cellID `n` no longer exists in the notebook. Returns an association with status and sweptCount.";
 
+SafeEval::usage =
+  "SafeEval[code, opts] is the canonical eval entry point used by both the socket bridge and \
+the Python session manager. It pre-parses `code` with ToExpression+HoldComplete (rewrapping \
+newline-split inputs into a single CompoundExpression), evaluates the held expression inside \
+TimeConstrained with a kernel-local sentinel tag, captures messages via EvaluationData, and \
+returns an Association keyed status, value, head, byteCount, leafCount, summary, inputForm, \
+messages, prints, outNumber, durationSeconds. Status is \"ok\" | \"parse_error\" | \"timeout\" | \
+\"aborted\" | \"kernel_error\". Options: \"EvalTimeout\" -> Null|sec, \"StoreOutNumber\" -> \
+Null|_Integer, \"PrintHandler\" -> Null|fn, \"SummaryMax\", \"InputFormMax\", \"MessageMax\".";
+
 Begin["`Private`"];
 
 If[! ValueQ[$BridgeState], $BridgeState = <||>];
@@ -329,27 +339,165 @@ resultInputFormFields[result_] := Module[{text, chars, maxChars},
   |>
 ];
 
-fullResultJSONRequestedQ[code_String] := StringContainsQ[code, "(*FULLJSON*)"];
+(* ============================================================ *)
+(* SafeEval — single source of truth for "evaluate user code,    *)
+(* tell me what happened". Used by both the socket bridge and    *)
+(* by the Python session manager (via wolframclient).            *)
+(* ============================================================ *)
 
-resultJSONFields[code_String, result_] := Module[{json, chars, full},
-  json = Quiet @ Check[ExportString[result, "RawJSON"], $Failed];
-  If[! StringQ[json],
-    Return[<|"resultJSON" -> Null, "resultJSONTruncated" -> False|>]
+Options[SafeEval] = {
+  "EvalTimeout"     -> Null,
+  "StoreOutNumber"  -> Null,
+  "PrintHandler"    -> Null,
+  "SummaryMax"      -> 500,
+  "InputFormMax"    -> 5000,
+  "MessageMax"      -> 1000
+};
+
+truncateInputFormString[text_String, maxChars_Integer] := If[
+  StringLength[text] <= maxChars,
+  text,
+  StringTake[text, maxChars] <> "... [truncated " <>
+    ToString[StringLength[text] - maxChars] <> " chars]"
+];
+
+(* Reasonable text summary: InputForm for small results (preserves quotes
+   for strings inside lists), Shallow OutputForm for larger ones. *)
+safeEvalSummary[res_, summaryMax_Integer] := Module[{lc, bc, text},
+  lc = LeafCount[res];
+  bc = ByteCount[res];
+  text = If[
+    AtomQ[res] || (lc <= 200 && bc <= 8000),
+    ToString[res, InputForm],
+    ToString[Shallow[res, {5, 20}], OutputForm]
   ];
-  chars = StringLength[json];
-  full = fullResultJSONRequestedQ[code];
-  If[full || chars <= $ResultJSONMaxChars,
-    <|
-      "resultJSON" -> Quiet @ Check[ImportString[json, "RawJSON"], Null],
-      "resultJSONTruncated" -> False,
-      "resultJSONChars" -> chars
-    |>,
-    <|
-      "resultJSON" -> Null,
-      "resultJSONTruncated" -> True,
-      "resultJSONChars" -> chars
-    |>
-  ]
+  truncateInputFormString[text, summaryMax]
+];
+
+safeEvalInputForm[res_, inputFormMax_Integer] :=
+  truncateInputFormString[ToString[res, InputForm], inputFormMax];
+
+storeOutHistory[outNumber_Integer, result_] := Module[{},
+  (* wolfram$mcp$out is the stable store used by MCP get_output tools.
+     Out[n] is protected in WSTP-driven kernels, so make it best-effort. *)
+  Quiet @ Check[Global`wolfram$mcp$out[outNumber] = result, Null];
+  Quiet @ Check[
+    Unprotect[Out];
+    Out[outNumber] = result;
+    Protect[Out],
+    Quiet @ Check[Protect[Out], Null];
+    Null
+  ];
+  Null
+];
+storeOutHistory[_, _] := Null;
+
+(* ToExpression on newline-separated input emits HoldComplete[a, b, c]
+   (multi-arg); ReleaseHold of that is Sequence[...]. Rewrap into one
+   CompoundExpression so we evaluate left-to-right and return the last.
+   $Messages = {} suppresses the message stream — EvaluationData still
+   captures the formatted text, but the kernel doesn't also pop a message
+   into the front-end. The bridge wrapper re-emits to the notebook when
+   appropriate. *)
+safeEvalParse[code_String] := Module[{data, held},
+  data = Block[{$Messages = {}},
+    EvaluationData[Check[ToExpression[code, InputForm, HoldComplete], $Failed]]
+  ];
+  held = data["Result"];
+  If[held =!= $Failed,
+    held = Replace[held, HoldComplete[args___] :> HoldComplete[CompoundExpression[args]]]
+  ];
+  {held, data["MessagesText"]}
+];
+
+SafeEval[code_String, OptionsPattern[]] := Module[
+  {
+    evalTimeout  = OptionValue["EvalTimeout"],
+    storeOut     = OptionValue["StoreOutNumber"],
+    printHandler = OptionValue["PrintHandler"],
+    summaryMax   = OptionValue["SummaryMax"],
+    inputFormMax = OptionValue["InputFormMax"],
+    messageMax   = OptionValue["MessageMax"],
+    parseMessages, held, started, duration, result, status,
+    runData, runMessages, timeoutTag, prints = {},
+    capturedPrint
+  },
+
+  {held, parseMessages} = safeEvalParse[code];
+
+  If[held === $Failed,
+    Return[<|
+      "status"          -> "parse_error",
+      "value"           -> Null,
+      "head"            -> "$Failed",
+      "byteCount"       -> 0,
+      "leafCount"       -> 0,
+      "summary"         -> "$Failed (parse error)",
+      "inputForm"       -> "$Failed",
+      "messages"        -> (truncateInputFormString[#, messageMax] & /@ parseMessages),
+      "prints"          -> {},
+      "outNumber"       -> storeOut,
+      "durationSeconds" -> 0.
+    |>]
+  ];
+
+  capturedPrint[args___] := Module[{rendered = SequenceForm[args]},
+    AppendTo[prints, ToString[Unevaluated[rendered], InputForm, PageWidth -> Infinity]];
+    If[printHandler =!= Null, printHandler[rendered]];
+    Null
+  ];
+
+  started = AbsoluteTime[];
+  status = "ok";
+  (* $Messages = {} suppresses the message stream so the kernel doesn't
+     pop messages into the user's front-end while we're evaluating an
+     agent-driven command. EvaluationData still captures the formatted
+     text via its own hook, so the returned envelope has the messages
+     and the bridge wrapper can re-render them as Message cells if not
+     silent. *)
+  result = CheckAbort[
+    Block[
+      {
+        $Context     = "Global`",
+        $ContextPath = DeleteDuplicates @ Join[{"System`", "Global`"}, $ContextPath],
+        $Messages    = {},
+        Print        = capturedPrint
+      },
+      runData = EvaluationData[
+        If[NumericQ[evalTimeout] && evalTimeout > 0,
+          TimeConstrained[ReleaseHold[held], evalTimeout, timeoutTag],
+          ReleaseHold[held]
+        ]
+      ];
+      runData["Result"]
+    ],
+    status = "aborted";
+    $Aborted
+  ];
+  duration = AbsoluteTime[] - started;
+
+  runMessages = If[AssociationQ[runData], Lookup[runData, "MessagesText", {}], {}];
+
+  If[result === timeoutTag,
+    status = "timeout";
+    result = $Aborted
+  ];
+
+  storeOutHistory[storeOut, result];
+
+  <|
+    "status"          -> status,
+    "value"           -> result,
+    "head"            -> ToString[Head[result]],
+    "byteCount"       -> ByteCount[result],
+    "leafCount"       -> LeafCount[result],
+    "summary"         -> safeEvalSummary[result, summaryMax],
+    "inputForm"       -> safeEvalInputForm[result, inputFormMax],
+    "messages"        -> (truncateInputFormString[#, messageMax] & /@ runMessages),
+    "prints"          -> (truncateInputFormString[#, messageMax] & /@ prints),
+    "outNumber"       -> storeOut,
+    "durationSeconds" -> N[duration, 6]
+  |>
 ];
 
 appendNotebookCell[nb_, cell_Cell] := Module[{},
@@ -402,136 +550,125 @@ withNotebookViewPreserved[nb_, expr_] := Module[
   result
 ];
 
-bridgeResultAssociation[id_String, code_String, status_String, result_, messages_List, prints_List, duration_] := Join[
-  <|
-    "id" -> id,
-    "timestamp" -> DateString[{"ISODate", " ", "Time"}],
-    "status" -> status
-  |>,
-  bridgeCodeFields[code],
-  resultInputFormFields[result],
-  resultJSONFields[code, result],
-  bridgeStringListFields["messages", messages],
-  bridgeStringListFields["prints", prints],
-  <|"durationSeconds" -> N[duration, 6]|>
+(* Build a printer that captures into `prints` (for the response envelope)
+   AND optionally renders to the notebook live (when echoPrint is True). *)
+bridgePrintHandler[nb_, echoPrint_] := If[
+  TrueQ[echoPrint] && $FrontEnd =!= Null && MatchQ[nb, _NotebookObject],
+  Function[expr,
+    appendNotebookCell[nb, Cell[BoxData @ ToBoxes[expr, StandardForm], "Print"]]
+  ],
+  Null
 ];
 
-evaluateBridgeCommand[commandId_String, code_String, state_Association] := Module[
-  {
-    held,
-    result = Null,
-    status = "ok",
-    messages = {},
-    prints = {},
-    parseMessages = {},
-    duration = 0.,
-    nb = state["Notebook"],
-    started,
-    printFunction,
-    silent = False,
-    evalTimeout = Null,
-    timeoutTag
-  },
+(* Build the bridge response envelope from SafeEval's Association. Keeps
+   the legacy field names (resultInputForm, resultJSON, messages, ...) so
+   bridge.py and existing consumers don't have to change. *)
+bridgeResponseFromSafeEval[
+  result_Association,
+  commandId_String,
+  code_String,
+  fullJson_:False
+] := Module[
+  {value = Lookup[result, "value", Null], jsonFields, inputForm, inputFormChars},
+  inputForm = Lookup[result, "inputForm", ""];
+  inputFormChars = StringLength[inputForm];
+  jsonFields = If[Lookup[result, "status"] === "ok",
+    resultJSONFieldsForValue[value, TrueQ[fullJson]],
+    <|"resultJSON" -> Null, "resultJSONTruncated" -> False|>
+  ];
+  Join[
+    <|
+      "id"        -> commandId,
+      "timestamp" -> DateString[{"ISODate", " ", "Time"}],
+      "status"    -> Lookup[result, "status", "ok"]
+    |>,
+    bridgeCodeFields[code],
+    <|
+      "resultInputForm"          -> inputForm,
+      "resultInputFormTruncated" -> TrueQ[StringContainsQ[inputForm, "... [truncated "]],
+      "resultInputFormChars"     -> inputFormChars
+    |>,
+    jsonFields,
+    bridgeStringListFields["messages", Lookup[result, "messages", {}]],
+    bridgeStringListFields["prints", Lookup[result, "prints", {}]],
+    <|"durationSeconds" -> N[Lookup[result, "durationSeconds", 0.], 6]|>
+  ]
+];
 
-  silent = StringStartsQ[code, "(*SILENT*)"];
-  evalTimeout = Replace[
-    First[
-      StringCases[
-        code,
-        "(*TIMEOUT:" ~~ n:NumberString ~~ "*)" :> ToExpression[n],
-        1
-      ],
-      Null
-    ],
-    x_ /; ! (NumericQ[x] && x > 0) -> Null
+(* Variant of resultJSONFields that takes the value directly (rather than
+   peeking at marker comments in the original code string). *)
+resultJSONFieldsForValue[value_, fullJson_:False] := Module[{json, chars},
+  json = Quiet @ Check[ExportString[value, "RawJSON"], $Failed];
+  If[!StringQ[json],
+    Return[<|"resultJSON" -> Null, "resultJSONTruncated" -> False|>]
+  ];
+  chars = StringLength[json];
+  If[fullJson || chars <= $ResultJSONMaxChars,
+    <|
+      "resultJSON"          -> Quiet @ Check[ImportString[json, "RawJSON"], Null],
+      "resultJSONTruncated" -> False,
+      "resultJSONChars"     -> chars
+    |>,
+    <|
+      "resultJSON"          -> Null,
+      "resultJSONTruncated" -> True,
+      "resultJSONChars"     -> chars
+    |>
+  ]
+];
+
+(* The main bridge entry point. Receives structured options from the v3
+   socket protocol (or {} for empty defaults). Renders input/output cells
+   into the notebook (when not silent), captures prints via SafeEval's
+   PrintHandler, and shapes SafeEval's Association into the bridge
+   response envelope. *)
+evaluateBridgeCommand[commandId_String, code_String, state_Association,
+                     opts:_Association:<||>] := Module[
+  {
+    nb = state["Notebook"],
+    silent = TrueQ[Lookup[opts, "silent", False]],
+    evalTimeoutRaw = Lookup[opts, "eval_timeout", Null],
+    fullJson = TrueQ[Lookup[opts, "full_json", False]],
+    evalTimeout, echoInput, echoOutput, echoPrint,
+    parseHeld, safeResult, response
+  },
+  evalTimeout = If[NumericQ[evalTimeoutRaw] && evalTimeoutRaw > 0, evalTimeoutRaw, Null];
+  echoInput = !silent && TrueQ[state["EchoInput"]];
+  echoOutput = !silent && TrueQ[state["EchoOutput"]];
+  echoPrint = !silent && TrueQ[state["EchoPrint"]];
+
+  (* Input cell echo. SafeEval re-parses internally; we re-parse here just
+     for the visual rendering — negligible cost. *)
+  If[echoInput && $FrontEnd =!= Null && MatchQ[nb, _NotebookObject],
+    Block[{$Messages = {}},
+      parseHeld = Quiet @ Check[ToExpression[code, InputForm, HoldComplete], $Failed]
+    ];
+    If[parseHeld =!= $Failed, appendInputCell[nb, parseHeld]]
   ];
 
-  (* EvaluationData captures messages as formatted text (e.g.
-     "ToExpression::sntxi : Incomplete expression; more input is needed.")
-     rather than bare HoldForm[Symbol::tag] references. $Messages = {} keeps
-     messages from being printed to the notebook / stderr; EvaluationData
-     uses its own capture path so the response envelope still gets them. *)
-  Block[
-    {
-      $Context = "Global`",
-      $ContextPath = DeleteDuplicates @ Join[{"System`", "Global`"}, $ContextPath],
-      $Messages = {}
-    },
-    Module[{data},
-      data = EvaluationData[
-        Check[ToExpression[code, InputForm, HoldComplete], $Failed]
+  safeResult = SafeEval[code,
+    "EvalTimeout"  -> evalTimeout,
+    "PrintHandler" -> bridgePrintHandler[nb, echoPrint]
+  ];
+
+  (* Output cell + messages cell echo. *)
+  If[!silent && MatchQ[nb, _NotebookObject],
+    Module[{status = Lookup[safeResult, "status"],
+            msgs = Lookup[safeResult, "messages", {}],
+            value = Lookup[safeResult, "value", Null]},
+      If[status === "ok" && msgs =!= {},
+        appendTextCell[nb, StringRiffle[msgs, "\n"], "Message"]
       ];
-      held = data["Result"];
-      parseMessages = data["MessagesText"]
+      If[status === "ok" && echoOutput && value =!= Null,
+        appendOutputCell[nb, value]
+      ];
+      If[status === "parse_error",
+        appendTextCell[nb, "Bridge parse error in command " <> commandId <> ".", "Message"]
+      ]
     ]
   ];
 
-  If[held =!= $Failed,
-    (* Newline-separated multi-statement input parses to a multi-arg
-       HoldComplete[a, b, c]; rewrap so ReleaseHold evaluates them as a
-       single CompoundExpression and returns the last value. *)
-    held = Replace[held, HoldComplete[args___] :> HoldComplete[CompoundExpression[args]]]
-  ];
-
-  If[held === $Failed,
-    status = "parse_error";
-    messages = parseMessages;
-    If[!silent,
-      appendTextCell[nb, "Bridge parse error in command " <> commandId <> ".", "Message"]
-    ];
-    Return[bridgeResultAssociation[commandId, code, status, $Failed, messages, prints, 0.]]
-  ];
-
-  If[!silent && TrueQ[state["EchoInput"]],
-    appendInputCell[nb, held]
-  ];
-
-  printFunction[args___] := Module[{printed = SequenceForm[args]},
-    AppendTo[prints, stringify[printed]];
-    If[!silent && TrueQ[state["EchoPrint"]],
-      appendNotebookCell[nb, Cell[BoxData @ ToBoxes[printed, StandardForm], "Print"]]
-    ];
-    Null
-  ];
-
-  started = AbsoluteTime[];
-  result = CheckAbort[
-    Block[
-      {
-        $Context = "Global`",
-        $ContextPath = DeleteDuplicates @ Join[{"System`", "Global`"}, $ContextPath],
-        $Messages = If[silent, {}, $Messages],
-        Print = printFunction
-      },
-      Module[{data},
-        data = EvaluationData[
-          If[NumericQ[evalTimeout],
-            TimeConstrained[ReleaseHold[held], evalTimeout, timeoutTag],
-            ReleaseHold[held]
-          ]
-        ];
-        messages = data["MessagesText"];
-        data["Result"]
-      ]
-    ],
-    status = "aborted";
-    $Aborted
-  ];
-  duration = AbsoluteTime[] - started;
-  If[result === timeoutTag,
-    status = "timeout";
-    result = $Aborted
-  ];
-
-  If[!silent && status === "ok" && messages =!= {},
-    appendTextCell[nb, StringRiffle[messages, "\n"], "Message"]
-  ];
-
-  If[!silent && status === "ok" && TrueQ[state["EchoOutput"]] && result =!= Null,
-    appendOutputCell[nb, result]
-  ];
-
-  bridgeResultAssociation[commandId, code, status, result, messages, prints, duration]
+  bridgeResponseFromSafeEval[safeResult, commandId, code, fullJson]
 ];
 
 socketBridgeToken[] := StringReplace[CreateUUID[], "-" -> ""];
@@ -632,7 +769,13 @@ handleSocketBridgeEvent[event_Association] := Module[
         code = Lookup[request, "code", $Failed];
         If[! StringQ[code],
           socketErrorResponse[id, "bad_request", "Request did not include a string code field."],
-          evaluateBridgeCommand[id, code, state]
+          (* Protocol v3: read silent/eval_timeout/full_json as structured
+             fields rather than parsing them out of `code` as comment
+             markers. KeyDrop strips token/id/code so only opts remain. *)
+          evaluateBridgeCommand[
+            id, code, state,
+            KeyDrop[request, {"id", "token", "code"}]
+          ]
         ]
       ]
   ];
@@ -698,19 +841,38 @@ cellIDOf[cell_Cell] := Module[{ids},
 
 cellIDOf[_] := Missing["NoID"];
 
-cellWithCellID[cell_Cell, id_Integer] := Module[{parts},
-  parts = List @@ cell;
+(* Build a new cell expression carrying `id` as CellID, preserving every
+   other option already in the cell. If the cell has no CellLabel option but
+   the front end is currently rendering an In[N]:= / Out[N]= label, we
+   capture that label and bake it back in so NotebookWrite doesn't blank it
+   out. The label lives in front-end render state, not in the stored cell
+   expression — without this step a notebook_read that assigns a fresh
+   CellID also wipes every In/Out label the user was looking at. *)
+cellWithPreservedCellID[cellObj_CellObject, cellExpr_Cell, id_Integer] := Module[
+  {parts, hasLabel, dynamicLabel, dynamicStyle, extras = {}},
+  parts = List @@ cellExpr;
+  hasLabel = ! FreeQ[Rest[parts], HoldPattern[CellLabel -> _]];
+  If[! hasLabel,
+    dynamicLabel = Quiet @ Check[CurrentValue[cellObj, CellLabel], ""];
+    dynamicStyle = Quiet @ Check[CurrentValue[cellObj, CellLabelStyle], None];
+    If[StringQ[dynamicLabel] && dynamicLabel =!= "",
+      AppendTo[extras, CellLabel -> dynamicLabel];
+      AppendTo[extras, CellLabelAutoDelete -> False];
+      If[dynamicStyle =!= None,
+        AppendTo[extras, CellLabelStyle -> dynamicStyle]
+      ]
+    ]
+  ];
   Apply[
     Cell,
     Join[
       {First[parts]},
       DeleteCases[Rest[parts], HoldPattern[CellID -> _], {1}],
+      extras,
       {CellID -> id}
     ]
   ]
 ];
-
-cellWithCellID[other_, _Integer] := other;
 
 cellIDsInNotebook[nb_NotebookObject] := DeleteMissing[
   cellIDOf /@ (Quiet @ Check[NotebookRead /@ Cells[nb], {}])
@@ -753,7 +915,14 @@ normalizeCellIDsInNotebook[nb_NotebookObject] := Module[
       existing = cellIDOf[cellExpr];
       If[MissingQ[existing] || KeyExistsQ[used, existing],
         newId = nextFreeCellIDFromUsed[used, nextId];
-        NotebookWrite[cellObj, cellWithCellID[cellExpr, newId]];
+        (* NotebookWrite replaces the entire cell expression, so the
+           front-end's dynamically-rendered In[N]:= / Out[N]= CellLabels
+           would vanish (they live in render state, not in the stored Cell
+           expression). cellWithPreservedCellID captures CurrentValue[
+           cellObj, CellLabel] before rewriting and bakes it back in.
+           SetOptions[cellObj, CellID -> ...] alone doesn't persist the
+           CellID in a way NotebookRead can see, so we have to NotebookWrite. *)
+        NotebookWrite[cellObj, cellWithPreservedCellID[cellObj, cellExpr, newId]];
         If[MissingQ[existing],
           AppendTo[assigned, <|"index" -> i, "newCellID" -> newId|>],
           AppendTo[
@@ -991,9 +1160,9 @@ BridgeRunCell[path_String, cellID_Integer, evalTimeout_:Null] := Module[
     result = $Aborted
   ];
 
-  (* Persist Out[lineNum] so the kernel's history mirrors a main-loop eval, *)
-  (* and label both input + output cells so the front end shows In[N]:= / Out[N]= *)
-  Quiet @ Check[Out[lineNum] = result, Null];
+  (* Persist result history and label both input + output cells so the
+     front end shows In[N]:= / Out[N]=. *)
+  storeOutHistory[lineNum, result];
   (* CellLabelAutoDelete -> False keeps the label text from being cleared. *)
   (* CellLabelStyle -> "CellLabel" (without "CellLabelExpired") keeps the  *)
   (* label rendered as a fresh / just-evaluated label, not a stale one.    *)

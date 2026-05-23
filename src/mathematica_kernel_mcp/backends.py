@@ -17,10 +17,11 @@ a matching bridge exists in the global bridge registry.
 
 from __future__ import annotations
 
-import json
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from pathlib import Path
+
+from wolframclient.language import wlexpr
 
 from .bridge import BridgeError, SharedKernelBridge, bridge_record_for_file
 from .parser import (
@@ -415,15 +416,13 @@ class SoloBackend(Backend):
         return {"status": "ok", "swept_count": 0, "note": "solo mode no-op"}
 
     def evaluate_for_json(self, code):
-        raw = self.manager.evaluate_raw(f'ExportString[({code}), "RawJSON"]')
-        # ExportString[..., "RawJSON"] returns a WL String whose codes are the
-        # UTF-8 bytes of the encoded JSON; recode so non-ASCII content comes
-        # back as proper Unicode rather than as bytes-as-chars.
-        try:
-            raw = raw.encode("latin-1").decode("utf-8")
-        except (UnicodeEncodeError, UnicodeDecodeError):
-            pass
-        return json.loads(raw)
+        # Internal-only path: caller built `code` and wants its native Python
+        # value. wolframclient converts WL→Python directly (strings → str,
+        # Integer → int, List → list, Association → dict, Real → Decimal),
+        # so no ExportString / JSON round-trip is needed.
+        from .session import _to_python
+        managed = self.manager.get_session("main")
+        return _to_python(managed.session.evaluate(wlexpr(code)))
 
     def abort_evaluation(self, signal: str = "SIGINT") -> dict:
         pid = self.manager.abort_session("main", signal=signal)

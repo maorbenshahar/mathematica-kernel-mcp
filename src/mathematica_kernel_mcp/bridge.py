@@ -283,6 +283,7 @@ class SharedKernelBridge:
         *,
         silent: bool = True,
         eval_timeout: float | None = None,
+        full_json: bool = False,
     ) -> dict:
         """Evaluate Wolfram Language code through the authenticated socket bridge.
 
@@ -290,18 +291,21 @@ class SharedKernelBridge:
         the evaluation runs longer, the bridge aborts it and returns status
         "timeout". This is distinct from `self.timeout`, which bounds the socket
         call itself.
+
+        Protocol v3: `silent`, `eval_timeout`, and `full_json` ship as
+        structured JSON fields rather than as `(*SILENT*)` / `(*TIMEOUT:N*)` /
+        `(*FULLJSON*)` comments embedded in `code`. Old comment-marker
+        injection collided with any user code that happened to contain those
+        literal strings.
         """
         cmd_id = f"mcp_{uuid.uuid4().hex[:12]}"
-
-        markers = []
-        if silent:
-            markers.append("(*SILENT*)")
-        if eval_timeout is not None and eval_timeout > 0:
-            markers.append(f"(*TIMEOUT:{eval_timeout}*)")
-        prefix = ("\n".join(markers) + "\n") if markers else ""
-        command = prefix + code
-
-        return self._call_socket(cmd_id, command)
+        return self._call_socket(
+            cmd_id,
+            code,
+            silent=silent,
+            eval_timeout=eval_timeout,
+            full_json=full_json,
+        )
 
     def _read_socket_response(self, sock: socket.socket, cmd_id: str) -> bytes:
         if self.socket_connection.protocol != "jsonl-content-length-v1":
@@ -352,13 +356,31 @@ class SharedKernelBridge:
                 )
             return raw_response
 
-    def _call_socket(self, cmd_id: str, command: str) -> dict:
+    def _call_socket(
+        self,
+        cmd_id: str,
+        command: str,
+        *,
+        silent: bool = True,
+        eval_timeout: float | None = None,
+        full_json: bool = False,
+    ) -> dict:
         conn = self.socket_connection
-        request = {
+        request: dict = {
             "id": cmd_id,
             "token": conn.token,
             "code": command,
+            "silent": silent,
+            "full_json": full_json,
         }
+        if eval_timeout is not None and eval_timeout > 0:
+            request["eval_timeout"] = eval_timeout
+        # ensure_ascii=True (the default) so non-ASCII chars become \uXXXX
+        # escapes. Mathematica's ImportString[..., "RawJSON"] decodes those
+        # escapes back to proper Unicode in the resulting WL String. A
+        # literal-Unicode JSON would be rejected — RawJSON treats the WL
+        # string as bytes and would try to UTF-8-parse codepoint 233 as the
+        # start of a multi-byte sequence and fail.
         data = (json.dumps(request, separators=(",", ":")) + "\n").encode("utf-8")
 
         try:
@@ -396,7 +418,7 @@ class SharedKernelBridge:
         self, code: str, *, eval_timeout: float | None = None
     ) -> dict | list:
         """Run a primitive that returns a JSON-serializable association/list."""
-        result = self.call(f"(*FULLJSON*)\n{code}", eval_timeout=eval_timeout)
+        result = self.call(code, eval_timeout=eval_timeout, full_json=True)
         if result.get("status") != "ok":
             raise BridgeError(
                 f"Bridge call returned status={result.get('status')}: "
@@ -456,7 +478,13 @@ class SharedKernelBridge:
 
     @staticmethod
     def _wl_string(value: str) -> str:
-        return json.dumps(value)
+        # ensure_ascii=False so non-ASCII chars pass through as themselves
+        # rather than as \\uXXXX escapes. The result is embedded in WL source
+        # code (e.g. BridgeInsertCellAfter[..., "<content>"]), and WL's
+        # string-literal parser doesn't understand \\u escapes (it uses
+        # \\:NNNN). The outer socket envelope still uses ensure_ascii=True
+        # because Mathematica's RawJSON parser handles \\u correctly there.
+        return json.dumps(value, ensure_ascii=False)
 
     def read_notebook(
         self,

@@ -1,17 +1,29 @@
-"""Session manager for persistent Wolfram Language kernel sessions."""
+"""Session manager for persistent Wolfram Language kernel sessions.
 
-import json
+Evaluation goes through the SharedKernelMCP`SafeEval paclet helper — the
+same WL function the socket bridge uses. wolframclient delivers SafeEval's
+Association as a Python mapping, so values come back natively (Unicode strings,
+arbitrary-precision ints, lists/dicts) without any JSON intermediary.
+"""
+
 import logging
 import os
 import signal as _signal
 import shutil
 import threading
+from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass
-from textwrap import dedent
+from decimal import Decimal
+from pathlib import Path
 
 from wolframclient.evaluation import WolframLanguageSession
-from wolframclient.language import wlexpr
+from wolframclient.language import wl, wlexpr
+
+try:
+    from wolframclient.utils.packedarray import PackedArray
+except ImportError:  # pragma: no cover - depends on wolframclient version
+    PackedArray = None
 
 from mathematica_kernel_mcp.models import EvalResult, SessionInfo
 
@@ -35,6 +47,45 @@ def _default_kernel_path() -> str | None:
         if found:
             return found
     return None
+
+
+def _paclet_directory() -> str | None:
+    """Return the directory containing the SharedKernelMCP paclet, if found.
+
+    The paclet ships alongside the Python package at <repo>/wolfram/. For
+    editable installs (`pip install -e .`) we can locate it relative to this
+    module. If the paclet is installed system-wide (PacletInstall), Needs[]
+    will find it without PacletDirectoryLoad.
+    """
+    candidate = Path(__file__).resolve().parents[2] / "wolfram"
+    if (candidate / "SharedKernelMCP" / "Kernel" / "init.m").is_file():
+        return str(candidate)
+    return None
+
+
+def _to_python(value):
+    """Recursively normalize wolframclient quirks into ordinary Python types.
+
+    - WL Lists arrive as tuples or PackedArray; we want lists.
+    - WL Associations arrive as `immutabledict`; we want plain dicts.
+    - WL Reals arrive as Decimal; we want float.
+    """
+    if isinstance(value, Decimal):
+        return float(value)
+    if PackedArray is not None and isinstance(value, PackedArray):
+        return _to_python(value.tolist())
+    if isinstance(value, Mapping):
+        return {k: _to_python(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_python(v) for v in value]
+    return value
+
+
+def _normalize_env(env: Mapping, out_number: int) -> dict:
+    """Normalize SafeEval's wolframclient-delivered dict for downstream use."""
+    out = {k: _to_python(v) for k, v in env.items()}
+    out.setdefault("outNumber", out_number)
+    return out
 
 
 @dataclass
@@ -71,13 +122,32 @@ class SessionManager:
         self._lock = threading.Lock()
 
     def _create_kernel_session(self) -> WolframLanguageSession:
-        """Create a new WolframLanguageSession."""
+        """Create a new WolframLanguageSession with SharedKernelMCP loaded."""
         if self._kernel_path:
             session = WolframLanguageSession(self._kernel_path)
         else:
             session = WolframLanguageSession()
         session.set_parameter("STARTUP_TIMEOUT", self._startup_timeout)
         return session
+
+    def _load_paclet(self, session: WolframLanguageSession) -> None:
+        """Make SharedKernelMCP`SafeEval available in this kernel.
+
+        Tries the dev-checkout location first; falls back to whatever the
+        user installed system-wide. If neither works, Needs[] returns
+        $Failed and subsequent evaluate() calls will surface a kernel_error
+        with a clear message.
+        """
+        paclet_dir = _paclet_directory()
+        if paclet_dir is not None:
+            session.evaluate(wl.PacletDirectoryLoad(paclet_dir))
+        result = session.evaluate(wl.Needs("SharedKernelMCP`"))
+        if str(result) == "$Failed":
+            logger.warning(
+                "Needs[\"SharedKernelMCP`\"] failed in scratch kernel. "
+                "Install the paclet with PacletInstall, or point "
+                "PacletDirectoryLoad at the paclet root."
+            )
 
     def start(self) -> None:
         """Start the session manager and create the main session."""
@@ -99,6 +169,7 @@ class SessionManager:
             raise ValueError(f"Session '{name}' already exists")
         session = self._create_kernel_session()
         session.start()
+        self._load_paclet(session)
         pid: int | None
         try:
             pid = int(session.evaluate(wlexpr("$ProcessID")))
@@ -165,15 +236,11 @@ class SessionManager:
         timeout: int = DEFAULT_TIMEOUT,
         summary_max: int = DEFAULT_SUMMARY_MAX,
     ) -> EvalResult:
-        """Evaluate code in a named session, return a summarized result.
+        """Evaluate code via the SharedKernelMCP`SafeEval paclet helper.
 
-        Distinguishes parse_error, timeout, and ok cases:
-        - Pre-parses with `ToExpression[..., HoldComplete]`; `$Failed` =>
-          status="parse_error" (matches the bridge path's semantics).
-        - Runs the parsed expression under `TimeConstrained[..., timeout, tag]`
-          with a unique sentinel tag; matching the tag => status="timeout".
-          (Avoids the old `str(result) == "$Aborted"` heuristic that would
-          mislabel user code legitimately returning `$Aborted`.)
+        wolframclient delivers SafeEval's Association as a Python mapping so
+        values (incl. Unicode strings, bignum ints) come back natively. No
+        JSON intermediary, no second meta round-trip.
         """
         managed = self.get_session(session_name)
         managed.is_busy = True
@@ -182,145 +249,84 @@ class SessionManager:
             in_number = managed.out_count
             out_number = managed.out_count
 
-            # Evaluate in a single Module so parse / timeout / ok are
-            # distinguished by a sentinel returned alongside the value.
-            # `wolfram$mcp$out[n]` is set so kernel_get_output can retrieve it.
-            # ensure_ascii=False so Unicode chars pass through as themselves;
-            # the default \uXXXX form is not valid WL string escape syntax.
-            code_literal = json.dumps(code, ensure_ascii=False)
-            store_code = dedent(
-                f"""
-                Module[{{wolfram$mcp$held, wolfram$mcp$timeoutTag, wolfram$mcp$eval}},
-                    wolfram$mcp$held = Check[
-                        ToExpression[{code_literal}, InputForm, HoldComplete],
-                        $Failed
-                    ];
-                    If[wolfram$mcp$held =!= $Failed,
-                        (* ToExpression on newline-separated input yields a
-                           multi-arg HoldComplete[a, b, c]; wrap into one
-                           CompoundExpression so ReleaseHold evaluates left to
-                           right and returns the last value. *)
-                        wolfram$mcp$held = Replace[
-                            wolfram$mcp$held,
-                            HoldComplete[args___] :> HoldComplete[CompoundExpression[args]]
-                        ]
-                    ];
-                    If[wolfram$mcp$held === $Failed,
-                        wolfram$mcp$out[{out_number}] = $Failed;
-                        "parse_error",
-                        wolfram$mcp$eval = TimeConstrained[
-                            ReleaseHold[wolfram$mcp$held],
-                            {timeout},
-                            wolfram$mcp$timeoutTag
-                        ];
-                        If[wolfram$mcp$eval === wolfram$mcp$timeoutTag,
-                            wolfram$mcp$out[{out_number}] = $Aborted;
-                            "timeout",
-                            wolfram$mcp$out[{out_number}] = wolfram$mcp$eval;
-                            "ok"
-                        ]
-                    ]
-                ]
-                """
+            env = managed.session.evaluate(
+                wl.SharedKernelMCP.SafeEval(
+                    code,
+                    wl.Rule("EvalTimeout", timeout),
+                    wl.Rule("StoreOutNumber", out_number),
+                    wl.Rule("SummaryMax", summary_max),
+                )
             )
 
-            raw = managed.session.evaluate_wrap(wlexpr(store_code))
-
-            messages: list[str] = []
-            if hasattr(raw, "messages") and raw.messages:
-                for msg in raw.messages:
-                    if isinstance(msg, tuple) and len(msg) >= 2:
-                        messages.append(str(msg[1]))
-                    else:
-                        messages.append(str(msg))
-
-            status_value = raw.result if hasattr(raw, "result") else raw
-            status = str(status_value)
-            if status not in {"ok", "parse_error", "timeout"}:
-                # Anything other than our three sentinels means the eval
-                # escaped the Module — uncaught Throw, recursion-limit
-                # abort, $Aborted via Interrupt, etc. Don't pretend it was a
-                # parse error; surface the actual cause via "kernel_error".
-                messages.insert(0, f"Eval escaped wrapper with: {status!r}")
+            if not isinstance(env, Mapping):
+                # Needs[] probably failed; SafeEval isn't defined. Surface the
+                # raw return so the caller sees what happened.
                 return EvalResult(
-                    output_summary=status[:summary_max],
+                    output_summary=str(env)[:summary_max],
                     head="$Failed",
                     byte_size=0,
                     leaf_count=0,
-                    messages=messages,
-                    is_truncated=len(status) > summary_max,
+                    messages=[
+                        "SharedKernelMCP`SafeEval is not defined in this kernel. "
+                        "Install the paclet (PacletInstall) or point "
+                        "PacletDirectoryLoad at the paclet root."
+                    ],
+                    is_truncated=False,
                     in_number=in_number,
                     out_number=out_number,
                     status="kernel_error",
                 )
 
-            if status == "parse_error":
-                return EvalResult(
-                    output_summary="$Failed (parse error)",
-                    head="$Failed",
-                    byte_size=0,
-                    leaf_count=0,
-                    messages=messages,
-                    is_truncated=False,
-                    in_number=in_number,
-                    out_number=out_number,
-                    status="parse_error",
-                )
-            if status == "timeout":
-                return EvalResult(
-                    output_summary="$Aborted (timed out)",
-                    head="$Aborted",
-                    byte_size=0,
-                    leaf_count=0,
-                    messages=messages,
-                    is_truncated=False,
-                    in_number=in_number,
-                    out_number=out_number,
-                    status="timeout",
-                )
-
-            # For small results, render in InputForm so the agent sees a
-            # faithful representation (string quotes preserved, full content).
-            # For large results, fall back to Shallow OutputForm — that's the
-            # only combination Mathematica actually elides (Shallow is an
-            # output-form-only operator; InputForm of Shallow prints the
-            # held expression literally without eliding).
-            meta_code = dedent(
-                f"""
-                With[{{res = wolfram$mcp$out[{out_number}]}},
-                    Module[{{lc = LeafCount[res], bc = ByteCount[res], summary}},
-                        summary = If[
-                            AtomQ[res] || (lc <= 200 && bc <= 8000),
-                            ToString[res, InputForm],
-                            ToString[Shallow[res, {{5, 20}}], OutputForm]
-                        ];
-                        {{summary, ToString[Head[res]], bc, lc}}
-                    ]
-                ]
-                """
-            )
-            meta = managed.session.evaluate(wlexpr(meta_code))
-
-            summary = str(meta[0]) if meta else ""
-            head = str(meta[1]) if meta else "Unknown"
-            byte_size = int(meta[2]) if meta else 0
-            leaf_count = int(meta[3]) if meta else 0
-
-            is_truncated = len(summary) > summary_max
-            if is_truncated:
-                summary = summary[:summary_max] + "..."
+            messages = [str(m) for m in env.get("messages", ())]
+            summary = str(env.get("summary", ""))
+            is_truncated = summary.endswith(" chars]") and "... [truncated " in summary
 
             return EvalResult(
                 output_summary=summary,
-                head=head,
-                byte_size=byte_size,
-                leaf_count=leaf_count,
+                head=str(env.get("head", "Unknown")),
+                byte_size=int(env.get("byteCount", 0)),
+                leaf_count=int(env.get("leafCount", 0)),
                 messages=messages,
                 is_truncated=is_truncated,
                 in_number=in_number,
                 out_number=out_number,
-                status="ok",
+                status=str(env.get("status", "ok")),
             )
+        finally:
+            managed.is_busy = False
+
+    def evaluate_native(self, code: str, session_name: str = "main",
+                        timeout: int = DEFAULT_TIMEOUT) -> dict:
+        """Evaluate code and return SafeEval's raw Association as a Python dict.
+
+        Use this when the caller wants the native Python value (e.g. the
+        `kernel_eval_json` tool needs the actual list/int/string/etc rather
+        than the textual summary). wolframclient delivers WL Strings as
+        Unicode `str`, WL Integers as arbitrary-precision `int`, WL Lists as
+        Python `list`, WL Associations as Python mappings.
+        """
+        managed = self.get_session(session_name)
+        managed.is_busy = True
+        try:
+            managed.out_count += 1
+            out_number = managed.out_count
+            env = managed.session.evaluate(
+                wl.SharedKernelMCP.SafeEval(
+                    code,
+                    wl.Rule("EvalTimeout", timeout),
+                    wl.Rule("StoreOutNumber", out_number),
+                )
+            )
+            if not isinstance(env, Mapping):
+                return {
+                    "status": "kernel_error",
+                    "messages": [
+                        "SharedKernelMCP`SafeEval not available; "
+                        f"raw return was {env!r}"
+                    ],
+                }
+            # Normalize wolframclient containers into JSON-friendly Python values.
+            return _normalize_env(env, out_number)
         finally:
             managed.is_busy = False
 
@@ -343,6 +349,7 @@ class SessionManager:
         managed = self.get_session(name)
         managed.session.stop()
         managed.session.start()
+        self._load_paclet(managed.session)
         managed.out_count = 0
         try:
             managed.pid = int(managed.session.evaluate(wlexpr("$ProcessID")))

@@ -271,96 +271,37 @@ def _kernel_eval_json(
     *,
     eval_timeout: float | None = None,
 ) -> dict:
-    """Evaluate WL and return a JSON envelope: {status, value?}.
+    """Evaluate WL and return a JSON envelope: {status, value?, inputForm}.
 
-    Pre-parses with ToExpression+HoldComplete so a syntax-broken `code`
-    surfaces as status="parse_error" rather than as a malformed JSON read.
-    Uses a kernel-local sentinel tag for timeout so user code returning the
-    literal symbol $Aborted is not mislabeled (matches SessionManager.evaluate).
-
-    Envelope shape:
-        {"status": "ok", "value": <decoded JSON>}
-        {"status": "parse_error"}
-        {"status": "timeout"}
+    Calls SafeEval via wolframclient, which delivers values as native Python
+    types (proper Unicode strings, arbitrary-precision ints, lists, dicts).
+    For values that contain non-JSON-serializable parts (Symbols, Graphics,
+    Rationals, etc.) the status becomes "not_json_encodable" and the caller
+    falls back to `inputForm`.
     """
     kid = _validate_kernel_id(kernel_id)
     timeout = _kernel_timeout(eval_timeout)
-    # ensure_ascii=False so Unicode chars pass through as themselves;
-    # the default \\uXXXX form is not valid WL string escape syntax.
-    code_literal = json.dumps(code, ensure_ascii=False)
-    wl = dedent(
-        f"""
-        Module[
-            {{
-                wolfram$mcp$held,
-                wolfram$mcp$timeoutTag,
-                wolfram$mcp$eval,
-                wolfram$mcp$json
-            }},
-            wolfram$mcp$held = Check[
-                ToExpression[{code_literal}, InputForm, HoldComplete],
-                $Failed
-            ];
-            If[wolfram$mcp$held =!= $Failed,
-                wolfram$mcp$held = Replace[
-                    wolfram$mcp$held,
-                    HoldComplete[args___] :> HoldComplete[CompoundExpression[args]]
-                ]
-            ];
-            If[wolfram$mcp$held === $Failed,
-                ExportString[<|"status" -> "parse_error"|>, "RawJSON"],
-                wolfram$mcp$eval = TimeConstrained[
-                    ReleaseHold[wolfram$mcp$held],
-                    {timeout},
-                    wolfram$mcp$timeoutTag
-                ];
-                If[wolfram$mcp$eval === wolfram$mcp$timeoutTag,
-                    ExportString[<|"status" -> "timeout"|>, "RawJSON"],
-                    wolfram$mcp$json = Quiet @ Check[
-                        ExportString[
-                            <|
-                                "status" -> "ok",
-                                "value" -> wolfram$mcp$eval,
-                                (* inputForm carries the full-precision string
-                                   representation so callers can recover
-                                   exact values that float64 JSON transport
-                                   would silently downgrade (bignum ints,
-                                   high-precision reals, rationals). *)
-                                "inputForm" -> StringTake[
-                                    ToString[wolfram$mcp$eval, InputForm],
-                                    UpTo[2000]
-                                ]
-                            |>,
-                            "RawJSON"
-                        ],
-                        $Failed
-                    ];
-                    If[StringQ[wolfram$mcp$json],
-                        wolfram$mcp$json,
-                        ExportString[
-                            <|
-                                "status" -> "not_json_encodable",
-                                "head" -> ToString[Head[wolfram$mcp$eval]],
-                                "inputForm" -> StringTake[
-                                    ToString[wolfram$mcp$eval, InputForm],
-                                    UpTo[2000]
-                                ]
-                            |>,
-                            "RawJSON"
-                        ]
-                    ]
-                ]
-            ]
-        ]
-        """
-    )
-    raw = manager.evaluate_raw(wl, session_name=kid)
-    envelope = json.loads(_utf8_recode(raw))
-    if not isinstance(envelope, dict) or "status" not in envelope:
-        raise ValueError(
-            f"kernel_eval_json: unexpected envelope shape {envelope!r}"
-        )
-    return envelope
+    env = manager.evaluate_native(code, session_name=kid, timeout=timeout)
+    status = env.get("status", "ok")
+    if status != "ok":
+        out = {"status": status}
+        if "inputForm" in env:
+            out["inputForm"] = env["inputForm"]
+        return out
+    value = env.get("value")
+    try:
+        json.dumps(value)
+        return {
+            "status": "ok",
+            "value": value,
+            "inputForm": env.get("inputForm"),
+        }
+    except (TypeError, ValueError):
+        return {
+            "status": "not_json_encodable",
+            "head": env.get("head"),
+            "inputForm": env.get("inputForm"),
+        }
 
 
 def _kernel_call(fn) -> dict:
@@ -903,22 +844,6 @@ def _normalize_terminal_text(text: str) -> str:
 
 def _wl_string(value: str) -> str:
     return json.dumps(value)
-
-
-def _utf8_recode(raw: str) -> str:
-    """Recover proper Unicode from a wolframclient-delivered RawJSON string.
-
-    `ExportString[..., "RawJSON"]` returns a WL String whose codes are the
-    UTF-8 byte values of the encoded JSON (e.g. for `"é"` the kernel returns a
-    String with codes 195, 169 instead of 233). wolframclient delivers that as
-    a Python `str` containing those bytes-as-chars, so an `encode("latin-1") +
-    decode("utf-8")` round-trip recovers the original Unicode. ASCII-only
-    output round-trips unchanged.
-    """
-    try:
-        return raw.encode("latin-1").decode("utf-8")
-    except (UnicodeEncodeError, UnicodeDecodeError):
-        return raw
 
 
 def _wl_string_list(values: list[str]) -> str:
