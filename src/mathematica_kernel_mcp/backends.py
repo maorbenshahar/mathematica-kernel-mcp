@@ -24,6 +24,8 @@ from pathlib import Path
 
 from .bridge import BridgeError, SharedKernelBridge, bridge_record_for_file
 from .parser import (
+    CellMarkerCollisionError,
+    CommentNestingError,
     StaleCellReferenceError,
     create_m_cell,
     delete_m_cell,
@@ -31,6 +33,9 @@ from .parser import (
     resolve_m_cell,
     update_m_cell,
 )
+
+
+_WRITE_REFUSAL_ERRORS = (CellMarkerCollisionError, CommentNestingError)
 
 
 _NOTEBOOK_EXTENSION = ".nb"
@@ -315,6 +320,8 @@ class SoloBackend(Backend):
             )
         except StaleCellReferenceError as exc:
             return _stale_reference_payload(exc)
+        except _WRITE_REFUSAL_ERRORS as exc:
+            return exc.to_payload()
         return {
             "status": "ok",
             "cellID": new_cell.cell_id,
@@ -333,6 +340,8 @@ class SoloBackend(Backend):
             )
         except StaleCellReferenceError as exc:
             return _stale_reference_payload(exc)
+        except _WRITE_REFUSAL_ERRORS as exc:
+            return exc.to_payload()
         return {
             "status": "ok",
             "newCellID": new_cell.cell_id,
@@ -352,6 +361,8 @@ class SoloBackend(Backend):
             )
         except StaleCellReferenceError as exc:
             return _stale_reference_payload(exc)
+        except _WRITE_REFUSAL_ERRORS as exc:
+            return exc.to_payload()
         return {
             "status": "ok",
             "newCellID": new_cell.cell_id,

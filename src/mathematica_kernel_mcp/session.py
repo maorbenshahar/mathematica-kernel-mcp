@@ -237,10 +237,22 @@ class SessionManager:
             status_value = raw.result if hasattr(raw, "result") else raw
             status = str(status_value)
             if status not in {"ok", "parse_error", "timeout"}:
-                # Unexpected — surface as parse_error with the raw status so
-                # callers can see what happened.
-                messages.insert(0, f"Unexpected eval status: {status!r}")
-                status = "parse_error"
+                # Anything other than our three sentinels means the eval
+                # escaped the Module — uncaught Throw, recursion-limit
+                # abort, $Aborted via Interrupt, etc. Don't pretend it was a
+                # parse error; surface the actual cause via "kernel_error".
+                messages.insert(0, f"Eval escaped wrapper with: {status!r}")
+                return EvalResult(
+                    output_summary=status[:summary_max],
+                    head="$Failed",
+                    byte_size=0,
+                    leaf_count=0,
+                    messages=messages,
+                    is_truncated=len(status) > summary_max,
+                    in_number=in_number,
+                    out_number=out_number,
+                    status="kernel_error",
+                )
 
             if status == "parse_error":
                 return EvalResult(
@@ -267,19 +279,23 @@ class SessionManager:
                     status="timeout",
                 )
 
+            # For small results, render in InputForm so the agent sees a
+            # faithful representation (string quotes preserved, full content).
+            # For large results, fall back to Shallow OutputForm — that's the
+            # only combination Mathematica actually elides (Shallow is an
+            # output-form-only operator; InputForm of Shallow prints the
+            # held expression literally without eliding).
             meta_code = dedent(
                 f"""
                 With[{{res = wolfram$mcp$out[{out_number}]}},
-                    {{
-                        If[
-                            AtomQ[res],
+                    Module[{{lc = LeafCount[res], bc = ByteCount[res], summary}},
+                        summary = If[
+                            AtomQ[res] || (lc <= 200 && bc <= 8000),
                             ToString[res, InputForm],
-                            ToString[Shallow[res, {{5, 3}}], OutputForm]
-                        ],
-                        ToString[Head[res]],
-                        ByteCount[res],
-                        LeafCount[res]
-                    }}
+                            ToString[Shallow[res, {{5, 20}}], OutputForm]
+                        ];
+                        {{summary, ToString[Head[res]], bc, lc}}
+                    ]
                 ]
                 """
             )

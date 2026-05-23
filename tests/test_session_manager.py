@@ -101,6 +101,26 @@ def test_missing_non_main_session_is_not_created(monkeypatch):
     assert manager.list_sessions() == []
 
 
+def test_evaluate_returns_kernel_error_on_unexpected_status(monkeypatch):
+    """Regression: when the eval Module escapes (uncaught Throw, recursion
+    abort, etc.), the returned 'status' is not one of our three sentinels.
+    Old code silently coerced this to 'parse_error', hiding the real cause.
+    Now it's labeled 'kernel_error' and the raw status text is surfaced."""
+    manager = _install_evaluating_session(
+        monkeypatch,
+        status_value="Hold[Throw[TerminatedEvaluation[RecursionLimit], 1024]]",
+        messages=[("Message", "Recursion depth of 1024 exceeded.")],
+    )
+
+    result = manager.evaluate("theta := theta + 1; theta")
+
+    assert result.status == "kernel_error"
+    assert "RecursionLimit" in result.output_summary
+    assert any("Recursion depth" in m for m in result.messages)
+    # The "Eval escaped wrapper" message should be prefixed
+    assert any("Eval escaped wrapper" in m for m in result.messages)
+
+
 def test_evaluate_returns_parse_error_status_when_kernel_reports_it(monkeypatch):
     manager = _install_evaluating_session(
         monkeypatch,
@@ -185,6 +205,28 @@ def test_evaluate_wraps_multi_arg_holdcomplete_into_compound_expression(monkeypa
     wl = captured[0]
     assert "HoldComplete[args___]" in wl
     assert "HoldComplete[CompoundExpression[args]]" in wl
+
+
+def test_kernel_eval_json_wl_template_carries_inputform(monkeypatch):
+    """Regression: kernel_eval_json must include an `inputForm` field on
+    status=ok so callers can recover values that the JSON-RPC float64 transport
+    silently mangles (bignum ints, high-precision reals, rationals). We assert
+    the WL template ships both `"value"` and `"inputForm"` keys."""
+    from mathematica_kernel_mcp.server import _kernel_eval_json
+
+    captured: list = []
+
+    class CapturingManager:
+        def evaluate_raw(self, wl, session_name="main"):
+            captured.append(wl)
+            return '{"status":"ok","value":1,"inputForm":"1"}'
+
+    _kernel_eval_json(CapturingManager(), "scratch", "2^200")
+
+    wl = captured[0]
+    assert '"status" -> "ok"' in wl
+    assert '"value" -> wolfram$mcp$eval' in wl
+    assert '"inputForm" -> StringTake' in wl
 
 
 def test_evaluate_passes_unicode_code_without_uXXXX_escapes(monkeypatch):

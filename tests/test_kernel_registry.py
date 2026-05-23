@@ -53,6 +53,30 @@ def test_truncate_result_input_form_recurses_into_batch_results():
     assert result["results"][1]["resultInputForm"] == "ok"
 
 
+def test_truncate_result_input_form_drops_oversized_resultjson():
+    """Regression: bridge can return resultJSON up to 200k chars, which can
+    blow past the MCP transport's per-message limit. Truncate by dropping the
+    field (caller can fall back to resultInputForm) rather than letting the
+    response error out."""
+    payload = {
+        "status": "ok",
+        "resultJSON": "x" * 50000,
+    }
+
+    result = _truncate_result_input_form(payload, json_max_chars=1000)
+
+    assert result["resultJSON"] is None
+    assert result["resultJSONTruncated"] is True
+    assert result["resultJSONChars"] == 50002  # 50000 chars + 2 quotes
+
+
+def test_truncate_result_input_form_preserves_small_resultjson():
+    payload = {"resultJSON": [1, 2, 3]}
+    result = _truncate_result_input_form(payload, json_max_chars=1000)
+    assert result["resultJSON"] == [1, 2, 3]
+    assert "resultJSONTruncated" not in result
+
+
 def test_truncate_result_input_form_bounds_code_messages_and_prints():
     payload = {
         "status": "ok",

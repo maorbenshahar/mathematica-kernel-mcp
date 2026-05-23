@@ -86,6 +86,7 @@ def _cell_preview(content: str, max_chars: int = 80) -> str:
 _RESULT_INPUTFORM_MAX_CHARS = 5000
 _RESULT_MESSAGE_PRINT_MAX_CHARS = 1000
 _RESULT_CODE_MAX_CHARS = 1000
+_RESULT_JSON_MAX_CHARS = 20000
 
 
 def _truncate_text(value: str, max_chars: int) -> tuple[str, bool, int]:
@@ -101,6 +102,7 @@ def _truncate_result_input_form(
     max_chars: int = _RESULT_INPUTFORM_MAX_CHARS,
     message_print_max_chars: int = _RESULT_MESSAGE_PRINT_MAX_CHARS,
     code_max_chars: int = _RESULT_CODE_MAX_CHARS,
+    json_max_chars: int = _RESULT_JSON_MAX_CHARS,
 ):
     if isinstance(payload, list):
         return [
@@ -109,6 +111,7 @@ def _truncate_result_input_form(
                 max_chars,
                 message_print_max_chars,
                 code_max_chars,
+                json_max_chars,
             )
             for item in payload
         ]
@@ -129,6 +132,21 @@ def _truncate_result_input_form(
         if truncated:
             result["resultInputFormTruncated"] = True
             result["resultInputFormChars"] = chars
+
+    # resultJSON can be any JSON-serializable value. If its serialized size
+    # exceeds the cap, replace with null + a truncation marker — large JSON
+    # payloads can blow past the MCP transport's per-message limit and the
+    # caller can fall back to resultInputForm. We don't try to partially
+    # serialize a complex value (that would change its shape silently).
+    if "resultJSON" in result and result["resultJSON"] is not None:
+        try:
+            serialized = json.dumps(result["resultJSON"], ensure_ascii=False)
+        except (TypeError, ValueError):
+            serialized = None
+        if serialized is not None and len(serialized) > json_max_chars:
+            result["resultJSON"] = None
+            result["resultJSONTruncated"] = True
+            result["resultJSONChars"] = len(serialized)
 
     for key in ("messages", "prints"):
         values = result.get(key)
@@ -160,6 +178,7 @@ def _truncate_result_input_form(
                 max_chars,
                 message_print_max_chars,
                 code_max_chars,
+                json_max_chars,
             )
             for item in result["results"]
         ]
@@ -299,7 +318,19 @@ def _kernel_eval_json(
                     ExportString[<|"status" -> "timeout"|>, "RawJSON"],
                     wolfram$mcp$json = Quiet @ Check[
                         ExportString[
-                            <|"status" -> "ok", "value" -> wolfram$mcp$eval|>,
+                            <|
+                                "status" -> "ok",
+                                "value" -> wolfram$mcp$eval,
+                                (* inputForm carries the full-precision string
+                                   representation so callers can recover
+                                   exact values that float64 JSON transport
+                                   would silently downgrade (bignum ints,
+                                   high-precision reals, rationals). *)
+                                "inputForm" -> StringTake[
+                                    ToString[wolfram$mcp$eval, InputForm],
+                                    UpTo[2000]
+                                ]
+                            |>,
                             "RawJSON"
                         ],
                         $Failed
@@ -512,6 +543,7 @@ def notebook_search(
     styles: list[str] | None = None,
     context_lines: int = 2,
     include_full_cell: bool = False,
+    max_matches: int = 200,
     timeout: float = 30.0,
 ) -> dict:
     """Search cells of `path` for `pattern`, returning line-level matches.
@@ -523,6 +555,10 @@ def notebook_search(
     - `styles=["Code", "Section", ...]`: restrict to cells of these styles.
     - `context_lines`: lines of context before/after each match.
     - `include_full_cell=True`: also include the cell's full content per match.
+    - `max_matches`: cap on total returned matches to keep the response under
+      MCP transport size limits. When truncated, `match_count` reflects the
+      total found and `truncated=True` is set; narrow the pattern or filter
+      by style to see the rest.
     """
     def _do(backend):
         result = backend.read(path)
@@ -547,12 +583,18 @@ def notebook_search(
 
         cell_results = []
         total_matches = 0
+        returned_matches = 0
+        truncated = False
         for c in all_cells:
             content = c.get("content", "")
             lines = content.split("\n")
             matches = []
             for i, line in enumerate(lines, start=1):
                 if _match(line):
+                    total_matches += 1
+                    if returned_matches >= max_matches:
+                        truncated = True
+                        continue
                     lo = max(1, i - context_lines)
                     hi = min(len(lines), i + context_lines)
                     context = [
@@ -560,8 +602,8 @@ def notebook_search(
                         for j in range(lo, hi + 1)
                     ]
                     matches.append({"line": i, "text": line, "context": context})
+                    returned_matches += 1
             if matches:
-                total_matches += len(matches)
                 entry = {
                     "cellID": c.get("cellID"),
                     "index": c.get("index"),
@@ -573,7 +615,7 @@ def notebook_search(
                     entry["content"] = content
                 cell_results.append(entry)
 
-        return {
+        payload = {
             "status": "ok",
             "path": path,
             "mode": backend.mode,
@@ -584,6 +626,10 @@ def notebook_search(
             "match_count": total_matches,
             "cells": cell_results,
         }
+        if truncated:
+            payload["truncated"] = True
+            payload["returned_matches"] = returned_matches
+        return payload
 
     return _backend_call(path, _do, timeout=timeout)
 
@@ -1086,13 +1132,18 @@ def kernel_eval_json(
     """Evaluate WL code in an agent-owned kernel and return RawJSON-decoded output.
 
     Possible `status` values:
-    - `"ok"` — response carries `result` (the decoded JSON value).
+    - `"ok"` — response carries `result` (the decoded JSON value) AND
+      `inputForm` (full-precision string). Prefer `inputForm` when the value
+      may contain bignum integers, high-precision reals, or rationals — the
+      JSON-RPC transport is float64, so e.g. `2^200` round-trips through
+      `result` as `1.6e+60` (lossy) but `inputForm` carries the exact
+      `"1606938...0376"`.
     - `"parse_error"` — the WL code did not parse.
     - `"timeout"` — evaluation exceeded `eval_timeout` (or the default).
     - `"not_json_encodable"` — the evaluated value (e.g. a `Symbol`,
       `Graphics`, pure function) has no JSON representation. Response carries
-      `head` and `inputForm` (truncated) so you can see what came back; if
-      you only need a textual summary, call `kernel_eval` instead.
+      `head` and `inputForm` so you can see what came back; if you only need
+      a textual summary, call `kernel_eval` instead.
     """
     def _do():
         kid = _validate_kernel_id(kernel_id)
@@ -1105,7 +1156,22 @@ def kernel_eval_json(
         status = envelope["status"]
         payload: dict = {"status": status, "kernel_id": kid}
         if status == "ok":
-            payload["result"] = envelope.get("value")
+            value = envelope.get("value")
+            # Cap the JSON-serialized result so a huge value (e.g. Range[10^6]
+            # — millions of elements) doesn't overflow the MCP transport's
+            # per-message limit. Callers can fall back to `inputForm` (also
+            # truncated to 2000 chars kernel-side) for a textual summary.
+            try:
+                serialized = json.dumps(value, ensure_ascii=False)
+            except (TypeError, ValueError):
+                serialized = None
+            if serialized is not None and len(serialized) > _RESULT_JSON_MAX_CHARS:
+                payload["result"] = None
+                payload["resultTruncated"] = True
+                payload["resultChars"] = len(serialized)
+            else:
+                payload["result"] = value
+            payload["inputForm"] = envelope.get("inputForm")
         elif status == "not_json_encodable":
             payload["head"] = envelope.get("head")
             payload["inputForm"] = envelope.get("inputForm")
@@ -1579,26 +1645,51 @@ def notebook_documentation_search(
 
 @mcp.tool()
 def notebook_list_symbols(
-    path: str, context: str = "Global`", timeout: float = 30.0
+    path: str,
+    context: str = "Global`",
+    limit: int = 500,
+    timeout: float = 30.0,
 ) -> dict:
     """List symbols for a context (e.g., 'Global`') or a `Names` pattern.
 
     Accepts either a context name like 'Global`' (auto-expanded to 'Global`*')
     or a literal Names pattern such as 'Plot*' or '*Integrate*'.
+
+    Caps at `limit` symbols (default 500) to keep the response under MCP
+    transport size limits — wide patterns like `System`*` would otherwise
+    return ~9000 symbols (~130k chars). When truncated, `count` reflects the
+    total available and `symbols` is the first `limit` of them.
     """
     try:
         normalized, pattern = _normalize_context_query(context)
     except ValueError as exc:
         return {"error": str(exc)}
-    expr = f"Names[{_wl_string(pattern)}]"
+    if limit < 1:
+        return {"error": "limit must be >= 1"}
+    # Sort + Take kernel-side so the trimmed-down list flows over the wire,
+    # not the full ~130k-char System` list.
+    expr = (
+        f"With[{{wolfram$mcp$names = Sort[Names[{_wl_string(pattern)}]]}}, "
+        f"{{Length[wolfram$mcp$names], Take[wolfram$mcp$names, UpTo[{int(limit)}]]}}]"
+    )
+
     def _do(backend):
-        symbols = backend.evaluate_for_json(expr)
-        return {
+        payload = backend.evaluate_for_json(expr)
+        if isinstance(payload, list) and len(payload) == 2:
+            total, symbols = payload
+        else:
+            total, symbols = 0, []
+        result = {
             "context": normalized,
             "pattern": pattern,
-            "count": len(symbols) if isinstance(symbols, list) else 0,
+            "count": total,
             "symbols": symbols,
         }
+        if isinstance(total, int) and total > len(symbols):
+            result["truncated"] = True
+            result["returnedCount"] = len(symbols)
+        return result
+
     return _backend_call(path, _do, timeout=timeout)
 
 

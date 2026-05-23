@@ -188,14 +188,137 @@ def _render_cell(cell: Cell) -> str:
     return f"{marker}\n{body}"
 
 
+class CellMarkerCollisionError(ValueError):
+    """A cell's body contains a line that would be misread as a cell marker.
+
+    Mathematica's package-file format uses `(* ::Style:: *)` lines as cell
+    boundaries. If a cell's content has such a line in its body, the file
+    would re-parse with the cell split in two (and Input cells fragmented in
+    that way no longer parse as WL). We refuse to write rather than silently
+    corrupt the file.
+    """
+
+    def __init__(self, cell_number: int, line_number: int, line_text: str):
+        super().__init__(
+            f"Cell #{cell_number} body contains a line that looks like a cell "
+            f"marker on line {line_number}: {line_text!r}. Writing it would "
+            "fragment the cell on read-back. Indent the line, break it across "
+            "two lines, or wrap the string differently to avoid the regex."
+        )
+        self.cell_number = cell_number
+        self.line_number = line_number
+        self.line_text = line_text
+
+    def to_payload(self) -> dict:
+        return {
+            "status": "cell_marker_collision",
+            "message": str(self),
+            "cellNumber": self.cell_number,
+            "lineNumber": self.line_number,
+            "lineText": self.line_text,
+        }
+
+
+class CommentNestingError(ValueError):
+    """A non-executable cell's content has unbalanced (* and *) markers.
+
+    Non-executable cells (Text, Section, etc.) are rendered as `(*content*)`.
+    If `content` contains a premature `*)` or an extra `(*`, the wrapping
+    comment becomes unbalanced, breaking the .m/.wl file as valid Wolfram
+    Language source even though our greedy regex may still recover the
+    cell's text. We refuse rather than write a file that wouldn't load
+    cleanly in Mathematica.
+    """
+
+    def __init__(self, cell_number: int, cell_type: str, reason: str):
+        super().__init__(
+            f"Cell #{cell_number} ({cell_type}) content has unbalanced WL "
+            f"comment markers: {reason}. Writing it would produce a file "
+            "that Mathematica's comment parser would split incorrectly."
+        )
+        self.cell_number = cell_number
+        self.cell_type = cell_type
+        self.reason = reason
+
+    def to_payload(self) -> dict:
+        return {
+            "status": "comment_nesting_error",
+            "message": str(self),
+            "cellNumber": self.cell_number,
+            "cellType": self.cell_type,
+            "reason": self.reason,
+        }
+
+
+def _comment_nesting_problem(content: str) -> str | None:
+    """Return a description of the imbalance, or None if `(*` / `*)` nest OK.
+
+    A non-executable cell's content gets wrapped as `(*content*)`. For that
+    file to parse as WL, every `*)` in `content` must be preceded by a
+    still-open `(*`, and the final depth (relative to content) must be zero.
+    """
+    depth = 0
+    i = 0
+    n = len(content)
+    while i < n - 1:
+        pair = content[i : i + 2]
+        if pair == "(*":
+            depth += 1
+            i += 2
+        elif pair == "*)":
+            if depth == 0:
+                return f"a `*)` at offset {i} closes the outer cell wrapper"
+            depth -= 1
+            i += 2
+        else:
+            i += 1
+    if depth > 0:
+        return f"{depth} unclosed `(*` left at end of content"
+    return None
+
+
+def _check_for_marker_collisions(rendered_cells: list[str], cells: list[Cell]) -> None:
+    """Raise if rendered cells would re-parse to something different.
+
+    Catches two write-time silent-corruption modes:
+    - A body line matches the cell-marker regex (fragments the cell on read).
+    - A non-executable cell's content unbalances the `(* ... *)` wrapping
+      (breaks the file as WL source).
+    """
+    for cell_number, (rendered, cell) in enumerate(
+        zip(rendered_cells, cells), start=1
+    ):
+        body_lines = rendered.splitlines()[1:]  # first line is the cell marker
+        for offset, line in enumerate(body_lines):
+            if CELL_MARKER_RE.match(line.strip()):
+                raise CellMarkerCollisionError(
+                    cell_number=cell_number,
+                    line_number=offset + 2,
+                    line_text=line,
+                )
+        if cell.cell_type not in EXECUTABLE_CELL_TYPES and cell.content.strip():
+            problem = _comment_nesting_problem(cell.content)
+            if problem is not None:
+                raise CommentNestingError(
+                    cell_number=cell_number,
+                    cell_type=cell.cell_type,
+                    reason=problem,
+                )
+
+
 def write_m_file(path: str | Path, cells: list[Cell]) -> None:
-    """Serialize cells back to a mutable .m/.wl file without MCP cell IDs."""
+    """Serialize cells back to a mutable .m/.wl file without MCP cell IDs.
+
+    Refuses to write if a cell body would re-parse differently than written
+    (marker collision, unbalanced `(*...*)` in a non-executable cell).
+    """
     path = Path(path)
     _validate_mutable_path(path)
     rendered_cells = []
     for number, cell in enumerate(cells, start=1):
         cell.number = number
         rendered_cells.append(_render_cell(cell))
+    _check_for_marker_collisions(rendered_cells, cells)
     text = "\n\n".join(rendered_cells)
     if text:
         text += "\n"
@@ -259,6 +382,12 @@ def parse_m_file(path: str | Path) -> list[Cell]:
     """
     path = Path(path)
     text = path.read_text()
+    # Strip a leading UTF-8 BOM (e.g. files saved by Windows editors). Without
+    # this the first line is `﻿(* ::Input:: *)` which the marker regex
+    # rejects, falling through to the unmarked-file fallback and silently
+    # collapsing every cell into one.
+    if text.startswith("﻿"):
+        text = text[1:]
     file_hash = _file_hash(text)
     lines = text.splitlines()
     if not any(CELL_MARKER_RE.match(line.strip()) for line in lines):

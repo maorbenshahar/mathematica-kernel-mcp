@@ -4,6 +4,8 @@ from textwrap import dedent
 from pathlib import Path
 
 from mathematica_kernel_mcp.parser import (
+    CellMarkerCollisionError,
+    CommentNestingError,
     StaleCellReferenceError,
     create_m_cell,
     parse_m_file,
@@ -149,6 +151,24 @@ def test_create_m_cell_bootstraps_markerless_file_into_mutable_cells(tmp_path):
     assert "[cell_id=" not in path.read_text()
 
 
+def test_parse_m_file_strips_utf8_bom(tmp_path):
+    """Regression: files saved with a leading UTF-8 BOM (common from Windows
+    editors) would silently collapse into one big unmarked cell because the
+    BOM made the first cell-marker line not match the regex."""
+    path = tmp_path / "bom.m"
+    path.write_bytes(
+        b"\xef\xbb\xbf(* ::Input:: *)\nx = 1\n\n(* ::Input:: *)\ny = 2\n"
+    )
+
+    cells = parse_m_file(path)
+
+    assert len(cells) == 2
+    assert cells[0].cell_type == "Input"
+    assert cells[0].content == "x = 1"
+    assert cells[1].cell_type == "Input"
+    assert cells[1].content == "y = 2"
+
+
 def test_parse_m_file_empty():
     """An empty .m file should produce no cells."""
     import tempfile
@@ -178,6 +198,56 @@ def test_update_m_cell_accepts_current_source_ref(tmp_path):
     assert updated.content == "x^3"
     assert [cell.content for cell in parse_m_file(path)] == ["x = 5", "x^3"]
     assert "[cell_id=" not in path.read_text()
+
+
+def test_create_m_cell_refuses_content_that_would_fragment_on_read(tmp_path):
+    """Regression: an Input cell whose body contains a line matching the
+    cell-marker regex would silently fragment into multiple cells on
+    read-back. Write must refuse rather than corrupt the file."""
+    path = tmp_path / "mutable.m"
+    path.write_text("(* ::Input:: *)\n1+1\n")
+
+    poisonous = "(* My code has a fake marker:\n(* ::Section:: *)\nstill the same cell *)\n1+1"
+
+    try:
+        create_m_cell(path, "Input", poisonous, after_cell=1)
+    except CellMarkerCollisionError as exc:
+        payload = exc.to_payload()
+    else:
+        raise AssertionError("expected CellMarkerCollisionError")
+
+    assert payload["status"] == "cell_marker_collision"
+    assert "::Section::" in payload["lineText"]
+    assert payload["lineNumber"] >= 2
+
+    # File on disk must be unchanged.
+    assert path.read_text() == "(* ::Input:: *)\n1+1\n"
+
+
+def test_create_text_cell_refuses_unbalanced_comment_markers(tmp_path):
+    """Regression: a Text cell wraps its content in `(*...*)`. If the content
+    contains `*)` not preceded by a matching `(*`, the wrapping comment
+    closes early, breaking the file as WL source. Our greedy regex may still
+    recover the cell text, but Mathematica's parser would split the file
+    incorrectly. Refuse the write."""
+    path = tmp_path / "mutable.m"
+    path.write_text("(* ::Input:: *)\n1+1\n")
+
+    poisonous = "A text cell with a closing comment marker: *) and more after"
+
+    try:
+        create_m_cell(path, "Text", poisonous, after_cell=1)
+    except CommentNestingError as exc:
+        payload = exc.to_payload()
+    else:
+        raise AssertionError("expected CommentNestingError")
+
+    assert payload["status"] == "comment_nesting_error"
+    assert payload["cellType"] == "Text"
+    assert "closes the outer cell wrapper" in payload["reason"]
+
+    # File on disk must be unchanged.
+    assert path.read_text() == "(* ::Input:: *)\n1+1\n"
 
 
 def test_update_m_cell_rejects_stale_source_ref(tmp_path):
