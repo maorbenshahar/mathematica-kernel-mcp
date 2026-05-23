@@ -1043,16 +1043,25 @@ BridgeReadNotebook[path_String, includeContent_: True, previewChars_: 80] := Mod
       "cellIDAssigned" -> Lookup[normalization, "assigned", {}],
       "cellIDRemapped" -> Lookup[normalization, "remapped", {}],
       "cells" -> Map[
-        Module[{cellObj, cellExpr, style, content},
+        Module[{cellObj, cellExpr, style, content, label, contentChars},
           cellObj = #["cellObject"];
           cellExpr = NotebookRead[cellObj];
           style = Replace[cellStyleOf[cellExpr], Except[_String] -> "Cell"];
           content = cellInputCode[cellObj];
+          contentChars = StringLength[content];
+          (* CurrentValue[cellObj, CellLabel] returns the front-end's
+             currently-rendered label (e.g. "In[24]:= ", "Out[24]= ") for
+             cells that have been evaluated, or "" otherwise. This gives the
+             agent the same visual handle the user has on the cell. *)
+          label = Quiet @ Check[CurrentValue[cellObj, CellLabel], ""];
+          If[! StringQ[label], label = ""];
           Join[
             <|
               "index" -> #["index"],
               "cellID" -> #["cellID"],
-              "style" -> style
+              "style" -> style,
+              "label" -> label,
+              "contentChars" -> contentChars
             |>,
             If[include,
               <|"content" -> content|>,

@@ -1,5 +1,6 @@
 import pytest
 
+import mathematica_kernel_mcp.server as server_mod
 from mathematica_kernel_mcp.backends import _integer_cell_id
 from mathematica_kernel_mcp.server import (
     _truncate_result_input_form,
@@ -77,6 +78,29 @@ def test_truncate_result_input_form_preserves_small_resultjson():
     assert "resultJSONTruncated" not in result
 
 
+def test_truncate_result_input_form_caller_max_chars_also_caps_resultjson():
+    """Regression: when the caller asks for max_response_chars=N, BOTH
+    resultInputForm AND resultJSON should be bounded by N. Earlier code
+    only applied N to resultInputForm and let resultJSON pass up to the
+    safety cap (20k), so a request for a tiny budget still returned a
+    medium-sized JSON payload."""
+    payload = {
+        "status": "ok",
+        "resultInputForm": "x" * 5000,
+        "resultJSON": list(range(500)),  # serializes to ~2900 chars
+    }
+
+    result = _truncate_result_input_form(
+        payload, max_chars=200, json_max_chars=20000
+    )
+
+    assert result["resultInputFormTruncated"] is True
+    assert len(result["resultInputForm"]) <= 250  # 200 + truncation marker
+    assert result["resultJSON"] is None
+    assert result["resultJSONTruncated"] is True
+    assert result["resultJSONChars"] > 200
+
+
 def test_truncate_result_input_form_bounds_code_messages_and_prints():
     payload = {
         "status": "ok",
@@ -102,3 +126,40 @@ def test_truncate_result_input_form_bounds_code_messages_and_prints():
     assert result["printsTruncated"] is True
     assert result["printsChars"] == [10]
     assert payload["prints"] == ["p" * 10]
+
+
+def test_notebook_get_output_full_uses_json_path_and_caps_in_kernel(monkeypatch):
+    """Regression: full/short output retrieval must not go through the
+    summarized eval envelope, which quotes and pre-truncates long strings.
+    """
+    captured = {}
+
+    class FakeBackend:
+        mode = "solo"
+
+        def evaluate(self, *_args, **_kwargs):
+            raise AssertionError("notebook_get_output should use evaluate_for_json")
+
+        def evaluate_for_json(self, code):
+            captured["code"] = code
+            return {"output": "abcdef", "chars": 9}
+
+    monkeypatch.setattr(
+        server_mod,
+        "get_backend_for",
+        lambda _path, _manager_factory, timeout=30.0: FakeBackend(),
+    )
+
+    result = server_mod.notebook_get_output(
+        "/tmp/sample.m", 3, view="full", max_chars=6
+    )
+
+    assert result == {
+        "out_number": 3,
+        "view": "full",
+        "output": "abcdef...",
+        "is_truncated": True,
+    }
+    assert "StringTake" in captured["code"]
+    assert "UpTo[6]" in captured["code"]
+    assert "ToString[Out[3], InputForm]" in captured["code"]

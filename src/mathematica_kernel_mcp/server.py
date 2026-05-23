@@ -83,7 +83,12 @@ def _cell_preview(content: str, max_chars: int = 80) -> str:
     return flat if len(flat) <= max_chars else flat[: max_chars - 3] + "..."
 
 
-_RESULT_INPUTFORM_MAX_CHARS = 5000
+# Default cap on `resultInputForm` (the textual result rendering). Kept small
+# by default so a casual eval doesn't flood the agent's context window —
+# callers wanting more can pass `max_response_chars` explicitly, and the full
+# value is still recoverable via kernel_get_output(out_number, view="full",
+# max_chars=N) when needed.
+_RESULT_INPUTFORM_MAX_CHARS = 1500
 _RESULT_MESSAGE_PRINT_MAX_CHARS = 1000
 _RESULT_CODE_MAX_CHARS = 1000
 _RESULT_JSON_MAX_CHARS = 20000
@@ -133,17 +138,21 @@ def _truncate_result_input_form(
             result["resultInputFormTruncated"] = True
             result["resultInputFormChars"] = chars
 
-    # resultJSON can be any JSON-serializable value. If its serialized size
-    # exceeds the cap, replace with null + a truncation marker — large JSON
-    # payloads can blow past the MCP transport's per-message limit and the
-    # caller can fall back to resultInputForm. We don't try to partially
-    # serialize a complex value (that would change its shape silently).
+    # resultJSON can be any JSON-serializable value. Apply BOTH caps:
+    # - the caller-supplied max_chars (the request-level response budget,
+    #   defaulting to _RESULT_INPUTFORM_MAX_CHARS=1500). Whichever is
+    #   stricter wins. Without this, asking for max_response_chars=200 still
+    #   sent back a 20k-char resultJSON.
+    # - json_max_chars (hard cap to keep us under MCP transport limits).
+    # On exceed, drop the value + mark with resultJSONTruncated; the caller
+    # falls back to resultInputForm.
     if "resultJSON" in result and result["resultJSON"] is not None:
         try:
             serialized = json.dumps(result["resultJSON"], ensure_ascii=False)
         except (TypeError, ValueError):
             serialized = None
-        if serialized is not None and len(serialized) > json_max_chars:
+        effective_cap = min(json_max_chars, max_chars)
+        if serialized is not None and len(serialized) > effective_cap:
             result["resultJSON"] = None
             result["resultJSONTruncated"] = True
             result["resultJSONChars"] = len(serialized)
@@ -333,7 +342,11 @@ bridge is present for the file you pass in. Use `bridge_list()` to inspect
 currently registered collaborative bridges.
 
 ## Cell-level workflow
-1. `notebook_read(path, include_content=False)` — get cell metadata with opaque IDs.
+1. `notebook_read(path)` — defaults to outline-only previews with `cellID`,
+   `style`, `label` (the user-visible `In[N]:= ` / `Out[N]= `, your shared
+   vocabulary with the user), and `contentChars`. Compose filters: `cells`,
+   `start`/`end`, `styles=["Title","Section","Subsection"]`, `around_cell`+
+   `window`. Pass `include_content=True` only when you need full bodies.
 2. `notebook_search(path, pattern)` — find cells by content with line-level matches.
 3. `notebook_run_cell(path, cell_id)` — evaluate a cell. In collab the Output appears
    under it in the live notebook; in solo just returns the result.
@@ -346,6 +359,18 @@ currently registered collaborative bridges.
 9. `notebook_eval(path, code)` — evaluate WL ad hoc, no notebook trace.
 10. `notebook_sweep_outputs(path)` — collab only: clean up Output cells whose
     anchor is gone. No-op in solo.
+
+## Context budget — responses count against your window
+- `notebook_read` defaults to previews (no full bodies) and tiny per-cell
+  overhead. Use `styles=["Section",...]` for an outline, `around_cell`+
+  `window` for local context after a search hit, `start`/`end` for a slice.
+- Eval and run tools accept `max_response_chars` (default ~1500). For a big
+  result, eval first, then `notebook_get_output(path, out_number,
+  view="summary")` to see `{head, leaf_count, byte_count}`, and only then
+  `view="full", max_chars=N` if you really want the bytes.
+- Use `kernel_eval(kernel_id, code)` instead of `kernel_eval_json` when you
+  only need the textual summary — `kernel_eval_json` returns the full Python
+  value (capped, but bigger by default).
 
 ## Kernel state + introspection
 - `notebook_kernel_state(path, fields=...)` — memory, version, context, packages.
@@ -433,22 +458,42 @@ def bridge_list(
 @mcp.tool()
 def notebook_read(
     path: str,
-    include_content: bool = True,
+    include_content: bool = False,
     cells: list[int | str] | None = None,
+    start: int | None = None,
+    end: int | None = None,
+    styles: list[str] | None = None,
+    around_cell: int | str | None = None,
+    window: int = 2,
     preview_chars: int = 80,
     timeout: float = 30.0,
 ) -> dict:
     """Read the cell layout of `path`.
 
-    In collab mode this reflects the live front-end notebook (with stable CellIDs
-    injected on first read). In solo mode this parses the file on disk; `.m`/`.wl`
-    cells return opaque source refs that go stale when the file changes.
+    In collab mode this reflects the live front-end notebook (with stable
+    CellIDs injected on first read). In solo mode this parses the file on
+    disk; `.m`/`.wl` cells return opaque source refs that go stale when the
+    file changes.
 
-    Filters:
-    - `include_content=False`: return one-line previews instead of full content
-      (cheap to scan when picking a cell).
-    - `cells=[id1, id2, ...]`: only return cells with those opaque cell IDs.
-    - `preview_chars`: max chars per preview when `include_content=False`.
+    Each cell carries `index`, `cellID`, `style`, `label` (the front-end's
+    `In[N]:= ` / `Out[N]= ` text in collab mode — your shared vocabulary with
+    the user — or `""` in solo), `contentChars` (full length even when only
+    `preview` is returned), and either `content` or `preview`.
+
+    Defaults to `include_content=False` — outline-first to keep responses
+    cheap. Pass `include_content=True` only when you actually need the full
+    bodies. Composable filters (apply in this order, the matching cells
+    become your view):
+
+    - `cells=[id1, id2, ...]`: only those opaque cell IDs.
+    - `start=N, end=M`: 1-indexed positional slice (inclusive).
+    - `styles=["Title", "Section", "Subsection"]`: only matching cell styles.
+      Combined with `include_content=False` this gives a cheap outline view.
+    - `around_cell=ID, window=K`: the named cell plus K cells before/after.
+
+    `preview_chars` caps the per-cell preview length (default 80).
+    Responses count against your context window — prefer the default
+    outline + targeted re-reads over a single full-content dump.
     """
     def _do(backend):
         result = backend.read(
@@ -457,9 +502,34 @@ def notebook_read(
             preview_chars=preview_chars,
         )
         all_cells = result.get("cells", [])
+
         if cells is not None:
             wanted = {str(cell_id) for cell_id in cells}
             all_cells = [c for c in all_cells if str(c.get("cellID")) in wanted]
+
+        if start is not None or end is not None:
+            lo = start if start is not None else 1
+            hi = end if end is not None else len(all_cells) + (start or 0)
+            all_cells = [c for c in all_cells if lo <= c.get("index", 0) <= hi]
+
+        if styles is not None:
+            wanted_styles = set(styles)
+            all_cells = [c for c in all_cells if c.get("style") in wanted_styles]
+
+        if around_cell is not None:
+            full = result.get("cells", [])
+            target_pos = next(
+                (i for i, c in enumerate(full)
+                 if str(c.get("cellID")) == str(around_cell)),
+                None,
+            )
+            if target_pos is None:
+                return {"error": f"around_cell={around_cell!r} not found"}
+            lo = max(0, target_pos - max(0, window))
+            hi = min(len(full), target_pos + max(0, window) + 1)
+            wanted_indices = {c.get("index") for c in full[lo:hi]}
+            all_cells = [c for c in all_cells if c.get("index") in wanted_indices]
+
         if not include_content:
             for c in all_cells:
                 c["preview"] = c.get(
@@ -467,6 +537,7 @@ def notebook_read(
                     _cell_preview(c.get("content", ""), preview_chars),
                 )
                 c.pop("content", None)
+
         result["cells"] = all_cells
         result["cell_count"] = len(all_cells)
         result["mode"] = backend.mode
@@ -582,6 +653,7 @@ def notebook_run_cell(
     timeout: float = 60.0,
     eval_timeout: float | None = None,
     kernel_id: str | None = None,
+    max_response_chars: int = _RESULT_INPUTFORM_MAX_CHARS,
 ) -> dict:
     """Evaluate the cell with the given cellID.
 
@@ -597,6 +669,8 @@ def notebook_run_cell(
     `eval_timeout` (seconds) is enforced kernel-side via TimeConstrained: when
     set, an evaluation exceeding it is aborted and returned with status="timeout".
     Use `eval_timeout` proactively when you don't trust a computation to finish.
+    `max_response_chars` caps the textual result (default ~1500); raise it or
+    call `notebook_get_output(..., view="full", max_chars=N)` for more.
     """
     if kernel_id is not None:
         def _scratch(backend):
@@ -612,14 +686,17 @@ def notebook_run_cell(
 
         return _backend_call(
             path,
-            lambda backend: _truncate_result_input_form(_scratch(backend)),
+            lambda backend: _truncate_result_input_form(
+                _scratch(backend), max_chars=max_response_chars
+            ),
             timeout=timeout,
         )
 
     return _backend_call(
         path,
         lambda b: _truncate_result_input_form(
-            b.run_cell(path, cell_id, eval_timeout=eval_timeout)
+            b.run_cell(path, cell_id, eval_timeout=eval_timeout),
+            max_chars=max_response_chars,
         ),
         timeout=timeout,
     )
@@ -691,6 +768,7 @@ def notebook_eval(
     code: str,
     timeout: float = 60.0,
     eval_timeout: float | None = None,
+    max_response_chars: int = _RESULT_INPUTFORM_MAX_CHARS,
 ) -> dict:
     """Evaluate WL code SILENTLY in the file's collab/solo kernel.
 
@@ -700,11 +778,17 @@ def notebook_eval(
 
     `eval_timeout` (seconds) wraps the eval in TimeConstrained kernel-side;
     on expiry, status="timeout". On a parse error, status="parse_error".
+
+    `max_response_chars` caps the textual result (`resultInputForm`) so a
+    casual probe doesn't flood your context window. Default ~1500 chars; if
+    you need the full value, call `notebook_get_output(path, out_number,
+    view="full", max_chars=N)`.
     """
     return _backend_call(
         path,
         lambda b: _truncate_result_input_form(
-            b.evaluate(path, code, eval_timeout=eval_timeout)
+            b.evaluate(path, code, eval_timeout=eval_timeout),
+            max_chars=max_response_chars,
         ),
         timeout=timeout,
     )
@@ -718,6 +802,7 @@ def notebook_eval_inline(
     cell_type: str = "Code",
     timeout: float = 60.0,
     eval_timeout: float | None = None,
+    max_response_chars: int = _RESULT_INPUTFORM_MAX_CHARS,
 ) -> dict:
     """Insert a Code cell after `anchor_cell_id`, evaluate it, return the result.
 
@@ -726,14 +811,15 @@ def notebook_eval_inline(
     in the file/notebook — `notebook_delete_cell` it later if you want to clean up.
 
     `eval_timeout` (seconds) wraps the eval in TimeConstrained kernel-side; on
-    expiry, status="timeout".
+    expiry, status="timeout". `max_response_chars` caps the textual result.
     """
     return _backend_call(
         path,
         lambda b: _truncate_result_input_form(
             b.eval_inline(
                 path, anchor_cell_id, code, cell_type, eval_timeout=eval_timeout
-            )
+            ),
+            max_chars=max_response_chars,
         ),
         timeout=timeout,
     )
@@ -1141,15 +1227,19 @@ def kernel_state(
 def kernel_get_output(
     kernel_id: str,
     out_number: int,
-    view: str = "full",
+    view: str = "summary",
     max_chars: int = 2000,
     depth: int = 3,
 ) -> dict:
     """Inspect a previous result stored by `kernel_eval` in a scratch kernel.
 
-    `view` mirrors `notebook_get_output`: "full" returns InputForm (truncated at
-    `max_chars`), "short" returns `Shallow` at `depth`, and "summary" returns
-    head / leaf_count / depth / byte_count / dimensions.
+    Defaults to `view="summary"` (head/leaf_count/byte_count, ~50 bytes) so a
+    casual lookup doesn't pull a big value into your context. Call again with
+    `view="full"` or `view="short"` once you've decided it's worth fetching.
+
+    `view` mirrors `notebook_get_output`: `"full"` returns InputForm (truncated
+    at `max_chars`), `"short"` returns `Shallow` at `depth`, `"summary"`
+    returns head / leaf_count / depth / byte_count / dimensions.
     """
     def _do():
         if view not in _GET_OUTPUT_VIEWS:
@@ -1215,6 +1305,7 @@ def notebook_run_cells(
     timeout: float = 60.0,
     eval_timeout: float | None = None,
     kernel_id: str | None = None,
+    max_response_chars: int = _RESULT_INPUTFORM_MAX_CHARS,
 ) -> dict:
     """Run multiple cells in order in a single MCP call.
 
@@ -1230,6 +1321,8 @@ def notebook_run_cells(
     `eval_timeout` (seconds) applies to each cell individually via TimeConstrained.
     If `kernel_id` is provided, selected cells are evaluated in that agent-owned
     scratch kernel and no visible notebook Output is written.
+    `max_response_chars` caps each per-cell textual result; with N cells your
+    aggregate response is roughly N × max_response_chars. Default ~1500.
     """
     def _do(backend):
         all_cells = backend.read(path).get("cells", [])
@@ -1295,7 +1388,7 @@ def notebook_run_cells(
                     "visible_output": False,
                 }
             )
-        return _truncate_result_input_form(payload)
+        return _truncate_result_input_form(payload, max_chars=max_response_chars)
 
     return _backend_call(path, _do, timeout=timeout)
 
@@ -1622,21 +1715,25 @@ def notebook_list_symbols(
 def notebook_get_output(
     path: str,
     out_number: int,
-    view: str = "full",
+    view: str = "summary",
     max_chars: int = 2000,
     depth: int = 3,
     timeout: float = 30.0,
 ) -> dict:
     """Inspect a previous evaluation's `Out[n]` value in the file's collab/solo kernel.
 
+    Default `view="summary"` returns only `{head, leaf_count, depth, byte_count,
+    dimensions}` — ~50 bytes, free to call. Use it to decide whether the value
+    is worth fetching before paying for `view="full"`.
+
     `view`:
-    - `"full"`: full InputForm string (truncated at `max_chars`).
+    - `"summary"` (default): structured `{head, leaf_count, depth, byte_count, dimensions}`.
     - `"short"`: `Shallow` rendering at `depth` (truncated at `max_chars`).
-    - `"summary"`: structured `<|head, leaf_count, depth, byte_count, dimensions|>`.
+    - `"full"`: full InputForm string (truncated at `max_chars`).
 
     For results stored in a scratch kernel by `kernel_eval`, use
-    `kernel_get_output(kernel_id, out_number, view=...)` — it has the same
-    `view` semantics but no path.
+    `kernel_get_output(kernel_id, out_number, view=...)` — same `view`
+    semantics but no path.
     """
 
     if view not in _GET_OUTPUT_VIEWS:
@@ -1663,21 +1760,30 @@ def notebook_get_output(
         )
 
     if view == "full":
-        wl = f"ToString[Out[{out_number}], InputForm]"
+        render_expr = f"ToString[Out[{int(out_number)}], InputForm]"
     else:
-        wl = f"ToString[Shallow[Out[{out_number}], {{{depth}, 3}}], OutputForm]"
+        render_expr = f"ToString[Shallow[Out[{int(out_number)}], {{{int(depth)}, 3}}], OutputForm]"
+    limit = max(0, int(max_chars))
+    wl = dedent(
+        f"""
+        Module[{{text = {render_expr}}},
+            <|
+                "output" -> StringTake[text, UpTo[{limit}]],
+                "chars" -> StringLength[text]
+            |>
+        ]
+        """
+    )
 
     def _do(backend):
-        envelope = backend.evaluate(path, wl)
-        raw = envelope.get("resultInputForm") if isinstance(envelope, dict) else None
-        if not isinstance(raw, str):
-            return {"out_number": out_number, "view": view, "error": "no_result", "envelope": envelope}
-        # `evaluate`'s resultInputForm wraps strings with quotes; strip them.
-        if raw.startswith('"') and raw.endswith('"') and len(raw) >= 2:
-            raw = raw[1:-1].encode().decode("unicode_escape")
-        is_truncated = len(raw) > max_chars
+        payload = backend.evaluate_for_json(wl)
+        raw = payload.get("output") if isinstance(payload, dict) else None
+        chars = payload.get("chars") if isinstance(payload, dict) else None
+        if not isinstance(raw, str) or not isinstance(chars, int):
+            return {"out_number": out_number, "view": view, "error": "no_result", "payload": payload}
+        is_truncated = chars > len(raw)
         if is_truncated:
-            raw = raw[:max_chars] + "..."
+            raw = raw + "..."
         result = {
             "out_number": out_number,
             "view": view,

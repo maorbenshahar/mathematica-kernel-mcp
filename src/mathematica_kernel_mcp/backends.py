@@ -227,6 +227,12 @@ def _cell_to_payload(cell, *, source_refs: bool = False) -> dict:
         "index": cell.number,
         "cellID": cell.cell_id if source_refs else cell.number,
         "style": cell.cell_type,
+        # `label` mirrors the bridge's CurrentValue[cellObj, CellLabel]. Solo
+        # mode doesn't have a front end so there's no rendered In[N]:= label
+        # to surface; the field is present (empty) for shape parity with the
+        # bridge response.
+        "label": "",
+        "contentChars": len(cell.content),
         "content": cell.content,
     }
     if source_refs:
