@@ -845,6 +845,9 @@ _SYMBOL_INFO_FIELDS = {
 }
 _GET_OUTPUT_VIEWS = {"full", "short", "summary"}
 _MAX_DOCUMENTATION_RESULTS = 25
+_DOCUMENTATION_CANDIDATE_MIN = 15
+_DOCUMENTATION_CANDIDATE_PER_RESULT = 5
+_DOCUMENTATION_CANDIDATE_MAX = 75
 _DOCUMENTATION_STOP_WORDS = {
     "a", "an", "and", "for", "function", "functions", "from", "in", "into",
     "of", "on", "or", "symbolic", "the", "to", "with",
@@ -942,22 +945,42 @@ def _symbol_list_expr(expr: str) -> str:
     return f'If[Length[{expr}] > 0, ToString[{expr}, InputForm], "None"]'
 
 
+def _documentation_candidate_limit(max_results: int) -> int:
+    return min(
+        _DOCUMENTATION_CANDIDATE_MAX,
+        max(
+            _DOCUMENTATION_CANDIDATE_MIN,
+            int(max_results) * _DOCUMENTATION_CANDIDATE_PER_RESULT,
+        ),
+    )
+
+
 def _documentation_tokens(query: str) -> list[str]:
-    tokens: list[str] = []
+    """Split `query` into search tokens, preserving the user's case.
+
+    The WL side uses `StringContainsQ[..., IgnoreCase -> True]` for the
+    actual match, so we never need to manufacture case variants — case is
+    handled at the matching site. Earlier versions lowercased the query
+    here, which silently destroyed information for mixed-case names like
+    `"Plot3D"` (became `"plot3d"` → `"Plot3d"`, never matching the real
+    symbol).
+    """
+    raw = _re.findall(r"[A-Za-z$][A-Za-z0-9$]*", query)
+    out: list[str] = []
     seen: set[str] = set()
-    raw = _re.findall(r"[A-Za-z$][A-Za-z0-9$]*", query.lower())
     for tok in raw:
-        if len(tok) < 3 or tok in _DOCUMENTATION_STOP_WORDS or tok in seen:
+        if len(tok) < 3 or tok.lower() in _DOCUMENTATION_STOP_WORDS or tok in seen:
             continue
         seen.add(tok)
-        tokens.append(tok)
-    if not tokens:
-        for tok in raw:
-            if tok in seen:
-                continue
-            seen.add(tok)
-            tokens.append(tok)
-    return tokens
+        out.append(tok)
+    if not out:
+        # Fall back to whatever was in the query so a short or unusual
+        # input still gets one search attempt (otherwise we'd return zero
+        # tokens and the kernel-side search would match nothing).
+        stripped = query.strip()
+        if stripped:
+            out.append(stripped)
+    return out
 
 
 def _normalize_context_query(context: str) -> tuple[str, str]:
@@ -1490,18 +1513,28 @@ def notebook_symbol_info(
         "messages": _symbol_list_expr("Messages[s]"),
     }
     selected = ", ".join(f'"{f}" -> {field_exprs[f]}' for f in wanted)
+    # Check Names[name] FIRST — Names doesn't create symbols, but
+    # ToExpression does (a previously-unknown bare name would otherwise be
+    # interned in Global`, silently polluting the user's kernel). Only
+    # proceed if at least one symbol matching `name` already exists on
+    # $ContextPath, so the lookup stays side-effect-free.
     expr = dedent(
         f"""
         Module[{{}},
             {_TEXT_HELPERS_WL}
-            With[{{held = ToExpression[{_wl_string(name)}, InputForm, HoldComplete]}},
-                If[
-                    MatchQ[held, HoldComplete[_Symbol]],
-                    Replace[
-                        held,
-                        HoldComplete[s_Symbol] :> <|{selected}|>
-                    ],
-                    <|"error" -> "Name did not resolve to a symbol"|>
+            With[{{matches = Names[{_wl_string(name)}]}},
+                If[matches === {{}},
+                    <|"error" -> "symbol_not_found"|>,
+                    With[{{held = ToExpression[{_wl_string(name)}, InputForm, HoldComplete]}},
+                        If[
+                            MatchQ[held, HoldComplete[_Symbol]],
+                            Replace[
+                                held,
+                                HoldComplete[s_Symbol] :> <|{selected}|>
+                            ],
+                            <|"error" -> "name_did_not_resolve_to_symbol"|>
+                        ]
+                    ]
                 ]
             ]
         ]
@@ -1533,6 +1566,7 @@ def notebook_documentation_search(
     if not q:
         return {"error": "Query must be non-empty"}
     limit = max(1, min(int(max_results), _MAX_DOCUMENTATION_RESULTS))
+    candidate_limit = _documentation_candidate_limit(limit)
     tokens = _documentation_tokens(q)
 
     expr = dedent(
@@ -1542,41 +1576,57 @@ def notebook_documentation_search(
             Module[
                 {{
                     query = {_wl_string(q)},
-                    queryLower,
                     queryTokens = {_wl_string_list(tokens)},
-                    queryTerms = {{}},
-                    symbolNames,
-                    entities,
+                    candidateLimit = {int(candidate_limit)},
+                    candidates,
                     results
                 }},
-                queryLower = ToLowerCase[query];
-                queryTerms = DeleteDuplicates[
-                    Join[
-                        queryTokens,
-                        Map[ToUpperCase[StringTake[#, 1]] <> StringDrop[#, 1] &, queryTokens]
+                (* Single Names[] call across System`; filter case-insensitively
+                   against the user's raw query and each whitespace token. The
+                   earlier implementation called Names["System`*<term>*"] per
+                   case-permuted variant, which is case-sensitive and missed
+                   mixed-case names like Plot3D. *)
+                candidates = Select[
+                    Names["System`*"],
+                    Function[n,
+                        Or[
+                            StringContainsQ[n, query, IgnoreCase -> True],
+                            AnyTrue[queryTokens, StringContainsQ[n, #, IgnoreCase -> True] &]
+                        ]
                     ]
                 ];
-                symbolNames = DeleteDuplicates[
-                    Flatten[Map[Names["System`*" <> # <> "*"] &, queryTerms], 1]
+                (* WolframLanguageData calls dominate runtime. Bound the heavy
+                   metadata pass after a cheap name-rank sort so short/common
+                   queries like "3D" or "in" cannot trigger thousands of
+                   documentation lookups before max_results is applied. *)
+                candidates = Take[
+                    SortBy[
+                        candidates,
+                        Function[n,
+                            {{
+                                If[ToLowerCase[n] === ToLowerCase[query], 0, 1],
+                                -Count[queryTokens, t_ /; StringContainsQ[n, t, IgnoreCase -> True]],
+                                If[StringContainsQ[n, query, IgnoreCase -> True], 0, 1],
+                                StringLength[n],
+                                n
+                            }}
+                        ]
+                    ],
+                    UpTo[candidateLimit]
                 ];
-                entities = Map[StringReplace[#, StartOfString ~~ "System`" -> ""] &, symbolNames];
                 results = Map[
                     Function[name,
                         Module[
-                            {{
-                                nameLower, entity, usage, usageLower, url, related,
-                                matchSources = {{}},
-                                exactNameHit, nameHit, usageHit,
-                                tokenNameHits, tokenUsageHits, usagePos
-                            }},
-                            nameLower = ToLowerCase[name];
+                            {{entity, usage, url, related,
+                              exactNameHit, nameHit, tokenNameHits,
+                              matchSources = {{}}, usageHit, tokenUsageHits,
+                              usagePos}},
                             entity = Entity["WolframLanguageSymbol", name];
                             usage = Replace[
                                 Quiet[Check[WolframLanguageData[entity, "PlaintextUsage"], ""]],
                                 _Missing -> ""
                             ];
                             usage = normalizeDisplayText[usage];
-                            usageLower = ToLowerCase[usage];
                             url = Replace[
                                 Quiet[Check[WolframLanguageData[entity, "URL"], Missing["NotAvailable"]]],
                                 _Missing -> Missing["NotAvailable"]
@@ -1585,54 +1635,58 @@ def notebook_documentation_search(
                                 Quiet[Check[WolframLanguageData[entity, "RelatedSymbols"], {{}}]],
                                 _Missing -> {{}}
                             ];
-                            exactNameHit = nameLower === queryLower;
-                            nameHit = StringContainsQ[nameLower, queryLower];
-                            usageHit = usage =!= "" && StringContainsQ[usageLower, queryLower];
-                            tokenNameHits = Count[queryTokens, token_ /; StringContainsQ[nameLower, token]];
+                            exactNameHit = ToLowerCase[name] === ToLowerCase[query];
+                            nameHit = StringContainsQ[name, query, IgnoreCase -> True];
+                            usageHit = usage =!= "" && StringContainsQ[usage, query, IgnoreCase -> True];
+                            tokenNameHits = Count[
+                                queryTokens,
+                                t_ /; StringContainsQ[name, t, IgnoreCase -> True]
+                            ];
                             tokenUsageHits = Count[
-                                queryTokens, token_ /; usage =!= "" && StringContainsQ[usageLower, token]
+                                queryTokens,
+                                t_ /; usage =!= "" && StringContainsQ[usage, t, IgnoreCase -> True]
                             ];
                             If[exactNameHit, AppendTo[matchSources, "exact_name"]];
-                            If[nameHit, AppendTo[matchSources, "name"]];
+                            If[nameHit && !exactNameHit, AppendTo[matchSources, "name"]];
                             If[usageHit, AppendTo[matchSources, "usage"]];
-                            If[tokenNameHits > 0, AppendTo[matchSources, "name_tokens"]];
-                            If[tokenUsageHits > 0, AppendTo[matchSources, "usage_tokens"]];
-                            If[
-                                !(exactNameHit || nameHit || usageHit || tokenNameHits > 0 || tokenUsageHits > 0),
-                                Nothing,
-                                usagePos = If[usageHit, First[First[StringPosition[usageLower, queryLower]]], 10^9];
-                                <|
-                                    "symbol" -> name,
-                                    "usage" -> usage,
-                                    "url" -> If[url === Missing["NotAvailable"], "", ToString[url, OutputForm]],
-                                    "match_sources" -> matchSources,
-                                    "related_symbols" -> Map[
-                                        ToString[#, OutputForm] &,
-                                        DeleteMissing[
-                                            Map[
-                                                Quiet[Check[
-                                                    WolframLanguageData[#, "Name"],
-                                                    Missing["NotAvailable"]
-                                                ]] &,
-                                                Take[related, UpTo[5]]
-                                            ]
+                            If[tokenNameHits > 0 && !nameHit, AppendTo[matchSources, "name_tokens"]];
+                            If[tokenUsageHits > 0 && !usageHit, AppendTo[matchSources, "usage_tokens"]];
+                            usagePos = If[
+                                usageHit,
+                                First[First[StringPosition[ToLowerCase[usage], ToLowerCase[query]]]],
+                                10^9
+                            ];
+                            <|
+                                "symbol" -> name,
+                                "usage" -> usage,
+                                "url" -> If[url === Missing["NotAvailable"], "", ToString[url, OutputForm]],
+                                "match_sources" -> matchSources,
+                                "related_symbols" -> Map[
+                                    ToString[#, OutputForm] &,
+                                    DeleteMissing[
+                                        Map[
+                                            Quiet[Check[
+                                                WolframLanguageData[#, "Name"],
+                                                Missing["NotAvailable"]
+                                            ]] &,
+                                            Take[related, UpTo[5]]
                                         ]
-                                    ],
-                                    "rank" -> {{
-                                        If[exactNameHit, 0, 1],
-                                        -tokenNameHits,
-                                        -tokenUsageHits,
-                                        If[nameHit, 0, 1],
-                                        If[usageHit, 0, 1],
-                                        usagePos,
-                                        StringLength[name],
-                                        name
-                                    }}
-                                |>
-                            ]
+                                    ]
+                                ],
+                                "rank" -> {{
+                                    If[exactNameHit, 0, 1],
+                                    -tokenNameHits,
+                                    -tokenUsageHits,
+                                    If[nameHit, 0, 1],
+                                    If[usageHit, 0, 1],
+                                    usagePos,
+                                    StringLength[name],
+                                    name
+                                }}
+                            |>
                         ]
                     ],
-                    entities
+                    candidates
                 ];
                 results = Cases[results, _Association];
                 results = Map[

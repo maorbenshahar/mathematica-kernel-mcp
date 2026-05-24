@@ -1106,6 +1106,21 @@ BridgeRunCell[path_String, cellID_Integer, evalTimeout_:Null] := Module[
   target = cellIDTargetAfterNormalization[nb, cellID];
   If[! MatchQ[target, _CellObject], Return[target]];
 
+  (* Refuse non-executable cells (Section/Title/Text/Output/...). Mirrors the
+     solo path, which checks cell.cell_type ∈ {"Input", "Code"} before
+     evaluating. Without this, running a Section like "integration functions"
+     was being evaluated as WL code (parsed as `integration*functions`). *)
+  Module[{cellStyle = Replace[cellStyleOf[NotebookRead[target]], Except[_String] -> "Cell"]},
+    If[!MemberQ[{"Input", "Code"}, cellStyle],
+      Return[<|
+        "status" -> "skipped",
+        "cellID" -> cellID,
+        "reason" -> "not_executable",
+        "cellType" -> cellStyle
+      |>]
+    ]
+  ];
+
   content = cellInputCode[target];
 
   (* EvaluationData captures messages as readable text; $Messages = {} keeps

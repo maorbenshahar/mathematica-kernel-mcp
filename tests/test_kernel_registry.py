@@ -71,6 +71,34 @@ def test_truncate_result_input_form_drops_oversized_resultjson():
     assert result["resultJSONChars"] == 50002  # 50000 chars + 2 quotes
 
 
+def test_documentation_candidate_limit_bounds_expensive_metadata_work():
+    from mathematica_kernel_mcp.server import _documentation_candidate_limit
+
+    assert _documentation_candidate_limit(1) == 15
+    assert _documentation_candidate_limit(3) == 15
+    assert _documentation_candidate_limit(10) == 50
+    assert _documentation_candidate_limit(25) == 75
+
+
+def test_documentation_tokens_preserves_user_case():
+    """Regression: tokenizer used to lowercase the query, silently
+    destroying information for mixed-case names ("Plot3D" → "plot3d") and
+    making the kernel-side search miss them. Now case is preserved; the
+    WL side does the case-insensitive match via StringContainsQ."""
+    from mathematica_kernel_mcp.server import _documentation_tokens
+
+    assert _documentation_tokens("Plot3D") == ["Plot3D"]
+    # Stop words are filtered case-insensitively.
+    assert _documentation_tokens("the Fourier transform") == [
+        "Fourier", "transform"
+    ]
+    # Tokens shorter than 3 chars are skipped, but the raw query is the
+    # fallback when no tokens survive.
+    assert _documentation_tokens("PT") == ["PT"]
+    # Empty query yields an empty token list.
+    assert _documentation_tokens("   ") == []
+
+
 def test_truncate_result_input_form_preserves_small_resultjson():
     payload = {"resultJSON": [1, 2, 3]}
     result = _truncate_result_input_form(payload, json_max_chars=1000)

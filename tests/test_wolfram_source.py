@@ -49,6 +49,54 @@ def test_evaluate_bridge_command_uses_structured_opts():
     assert "SafeEval[code" in body
 
 
+def test_bridge_run_cell_refuses_non_executable_cells():
+    """Regression: BridgeRunCell used to send Section/Title/Text content
+    straight to the kernel as WL code, so running a Section cell with content
+    "integration functions" produced `integration*functions` (implicit
+    multiplication). Solo refuses with status="skipped"; collab must too."""
+    body = _definition_between(INIT_M.read_text(), "BridgeRunCell", "BridgeUpdateCell")
+
+    # The style-gate is present before the eval.
+    assert "cellStyleOf[NotebookRead[target]]" in body
+    assert 'MemberQ[{"Input", "Code"}, cellStyle]' in body
+    assert '"status" -> "skipped"' in body
+    assert '"reason" -> "not_executable"' in body
+
+
+def test_documentation_search_caps_heavy_metadata_candidates():
+    """Regression: short/common docs queries can match many System` names.
+    The implementation must cap candidates before calling WolframLanguageData
+    so max_results is not applied only after hundreds of metadata lookups.
+    """
+    source = SERVER_PY.read_text()
+    body = source[source.index("def notebook_documentation_search("):]
+    body = body[: body.index("\n\n@mcp.tool()", 1)]
+
+    sort_pos = body.index("candidates = Take[")
+    metadata_pos = body.index("WolframLanguageData[entity")
+    assert sort_pos < metadata_pos
+    assert "candidateLimit" in body
+    assert "UpTo[candidateLimit]" in body
+
+
+def test_notebook_symbol_info_gates_on_names_to_avoid_polluting_global():
+    """Regression: notebook_symbol_info used to interpret an unknown bare
+    name (e.g. "FFT") via ToExpression, which interns the symbol in Global`
+    as a side-effect. Now Names[name] is consulted FIRST (Names doesn't
+    create symbols); only an existing symbol gets passed to ToExpression."""
+    source = SERVER_PY.read_text()
+    body = source[source.index("def notebook_symbol_info("):]
+    body = body[: body.index("\n\n@mcp.tool()")]
+
+    # Names check happens before ToExpression and short-circuits when empty.
+    names_pos = body.index("Names[")
+    to_expression_pos = body.index("ToExpression[")
+    assert names_pos < to_expression_pos, (
+        "Names[] check must run before ToExpression to avoid creating the symbol"
+    )
+    assert '"error" -> "symbol_not_found"' in body
+
+
 def test_normalize_cell_ids_preserves_dynamic_in_out_labels():
     """Regression: assigning a CellID during notebook_read used to clobber
     the front-end's In[N]:= / Out[N]= labels because NotebookWrite replaces
