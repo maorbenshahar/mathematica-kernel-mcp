@@ -68,10 +68,20 @@ def _to_python(value):
 
     - WL Lists arrive as tuples or PackedArray; we want lists.
     - WL Associations arrive as `immutabledict`; we want plain dicts.
-    - WL Reals arrive as Decimal; we want float.
+    - WL Reals arrive as `Decimal`. Machine-precision values that survive a
+      float64 roundtrip are downcast to `float` (JSON-friendly); arbitrary-
+      precision values stay as `Decimal` so `json.dumps` fails and the
+      caller falls back to `inputForm` instead of silently dropping ~38
+      digits on `N[Pi, 50]`-style results.
     """
     if isinstance(value, Decimal):
-        return float(value)
+        try:
+            as_float = float(value)
+        except (OverflowError, ValueError):
+            return value
+        if Decimal(str(as_float)) == value:
+            return as_float
+        return value
     if PackedArray is not None and isinstance(value, PackedArray):
         return _to_python(value.tolist())
     if isinstance(value, Mapping):
@@ -81,10 +91,13 @@ def _to_python(value):
     return value
 
 
-def _normalize_env(env: Mapping, out_number: int) -> dict:
+def _normalize_env(env: Mapping, out_number: int | None) -> dict:
     """Normalize SafeEval's wolframclient-delivered dict for downstream use."""
     out = {k: _to_python(v) for k, v in env.items()}
-    out.setdefault("outNumber", out_number)
+    if out_number is None:
+        out.pop("outNumber", None)
+    else:
+        out.setdefault("outNumber", out_number)
     return out
 
 
@@ -157,6 +170,13 @@ class SessionManager:
         """Stop all sessions."""
         with self._lock:
             for managed in self._sessions.values():
+                # Best-effort cleanup of any cached solo-mode headless
+                # notebooks so the embedded front-end doesn't outlive the
+                # kernel (would otherwise leave orphaned FE processes).
+                with suppress(Exception):
+                    managed.session.evaluate(
+                        wl.SharedKernelMCP.SoloCloseAllNotebooks()
+                    )
                 try:
                     managed.session.stop()
                 except Exception:
@@ -196,6 +216,8 @@ class SessionManager:
             managed = self._sessions.pop(name, None)
             if managed is None:
                 raise ValueError(f"Session '{name}' does not exist")
+            with suppress(Exception):
+                managed.session.evaluate(wl.SharedKernelMCP.SoloCloseAllNotebooks())
             managed.session.stop()
             logger.info("Closed session '%s'", name)
 
@@ -296,7 +318,8 @@ class SessionManager:
             managed.is_busy = False
 
     def evaluate_native(self, code: str, session_name: str = "main",
-                        timeout: int = DEFAULT_TIMEOUT) -> dict:
+                        timeout: int = DEFAULT_TIMEOUT,
+                        store_output: bool = True) -> dict:
         """Evaluate code and return SafeEval's raw Association as a Python dict.
 
         Use this when the caller wants the native Python value (e.g. the
@@ -308,15 +331,14 @@ class SessionManager:
         managed = self.get_session(session_name)
         managed.is_busy = True
         try:
-            managed.out_count += 1
-            out_number = managed.out_count
-            env = managed.session.evaluate(
-                wl.SharedKernelMCP.SafeEval(
-                    code,
-                    wl.Rule("EvalTimeout", timeout),
-                    wl.Rule("StoreOutNumber", out_number),
-                )
-            )
+            args = [code, wl.Rule("EvalTimeout", timeout)]
+            if store_output:
+                managed.out_count += 1
+                out_number: int | None = managed.out_count
+                args.append(wl.Rule("StoreOutNumber", out_number))
+            else:
+                out_number = None
+            env = managed.session.evaluate(wl.SharedKernelMCP.SafeEval(*args))
             if not isinstance(env, Mapping):
                 return {
                     "status": "kernel_error",
@@ -347,6 +369,8 @@ class SessionManager:
     def restart_session(self, name: str = "main") -> None:
         """Restart a kernel session (fresh state)."""
         managed = self.get_session(name)
+        with suppress(Exception):
+            managed.session.evaluate(wl.SharedKernelMCP.SoloCloseAllNotebooks())
         managed.session.stop()
         managed.session.start()
         self._load_paclet(managed.session)

@@ -268,6 +268,56 @@ def test_evaluate_native_returns_python_value(monkeypatch):
     assert env["inputForm"] == "{1, 2, 3}"
 
 
+
+def test_evaluate_native_can_skip_output_history(monkeypatch):
+    manager = _install_session(
+        monkeypatch,
+        evaluate_returns=[
+            ("SafeEval", _safe_eval_response(
+                value=[1, 2, 3], head="List",
+                summary="{1, 2, 3}", input_form="{1, 2, 3}",
+            )),
+        ],
+    )
+
+    env = manager.evaluate_native("Range[3]", store_output=False)
+    managed = manager._sessions["main"]
+    fake = managed.session
+
+    assert managed.out_count == 0
+    assert "outNumber" not in env
+    assert "StoreOutNumber" not in str(fake.evaluate_calls[-1])
+
+
+def test_to_python_preserves_arbitrary_precision_reals():
+    """Regression: a Decimal that overflows float64's ~17 significant digits
+    must survive _to_python rather than being silently downcast and losing
+    ~38 digits. Machine-precision Decimals are downcast (JSON-friendly);
+    high-precision Decimals are passed through, so the caller's json.dumps
+    fails and the eval envelope falls back to inputForm.
+    """
+    from decimal import Decimal
+
+    from mathematica_kernel_mcp.session import _to_python
+
+    # Machine precision: roundtrips through float64.
+    assert _to_python(Decimal("3.14")) == 3.14
+    assert isinstance(_to_python(Decimal("3.14")), float)
+
+    # Arbitrary precision: must stay as Decimal so the json path knows to
+    # fall back to inputForm rather than silently truncating.
+    high = Decimal("3.14159265358979323846264338327950288419716939937510582")
+    out = _to_python(high)
+    assert isinstance(out, Decimal)
+    assert out == high  # value untouched
+
+    # Nested through list/dict.
+    nested = _to_python({"x": [Decimal("2.0"), high]})
+    assert nested["x"][0] == 2.0
+    assert isinstance(nested["x"][0], float)
+    assert isinstance(nested["x"][1], Decimal)
+
+
 def test_evaluate_native_normalizes_nested_mapping_values(monkeypatch):
     """Regression: a returned WL Association can arrive as an immutable
     Mapping nested inside the SafeEval envelope. kernel_eval_json must see a
@@ -299,3 +349,120 @@ def test_evaluate_native_normalizes_nested_mapping_values(monkeypatch):
         "unicode": "héllo -> infinity",
         "list": [1, 2, 3],
     }
+
+
+def test_solo_backend_evaluate_for_json_routes_through_safeeval():
+    """Regression: SoloBackend.evaluate_for_json used to call
+    `session.evaluate(wlexpr(code))` directly, bypassing SafeEval. That meant
+    no eval_timeout protection (notebook_documentation_search could hang),
+    no is_busy tracking, and no structured error envelope. Now it goes
+    through manager.evaluate_native so it shares the bridge backend's
+    safety net."""
+    from mathematica_kernel_mcp.backends import SoloBackend, SoloBackendError
+
+    captured = {}
+
+    class FakeManager:
+        def evaluate_native(self, code, session_name="main", timeout=30, store_output=True):
+            captured["code"] = code
+            captured["store_output"] = store_output
+            return {"status": "ok", "value": [1, 2, 3]}
+
+    backend = SoloBackend(FakeManager())
+    assert backend.evaluate_for_json("Range[3]") == [1, 2, 3]
+    assert captured["code"] == "Range[3]"
+    assert captured["store_output"] is False
+
+    class FailingManager:
+        def evaluate_native(self, code, session_name="main", timeout=30, store_output=True):
+            return {"status": "parse_error", "messages": ["bad input"]}
+
+    bad = SoloBackend(FailingManager())
+    with pytest.raises(SoloBackendError, match="parse_error"):
+        bad.evaluate_for_json("Sqrt[")
+
+
+def test_solo_backend_read_calls_solo_read_notebook():
+    """Regression: solo `.m`/`.wl` cell layout now flows through Mathematica's
+    own machinery via SharedKernelMCP`SoloReadNotebook, not a Python parser.
+    The earlier regex-based parser disagreed with the front-end's view (e.g.
+    treating a `.wl` file with a `(* ::Package:: *)` header as one cell when
+    Mathematica's front-end shows multiple blank-line-separated cells)."""
+    from mathematica_kernel_mcp.backends import SoloBackend
+
+    captured = {}
+
+    class FakeManager:
+        def evaluate_native(self, code, session_name="main", timeout=30, store_output=True):
+            captured["code"] = code
+            return {"status": "ok", "value": {"status": "ok", "cells": []}}
+
+    backend = SoloBackend(FakeManager())
+    backend.read("/tmp/foo.wl", include_content=False, preview_chars=42)
+
+    assert "SoloReadNotebook" in captured["code"]
+    assert "/tmp/foo.wl" in captured["code"]
+    assert "False" in captured["code"]  # include_content
+    assert "42" in captured["code"]
+
+
+def test_solo_backend_run_cell_uses_get_content_then_manager_evaluate():
+    """Solo run_cell splits into (a) WL call to SoloGetCellContent and
+    (b) manager.evaluate of the returned content. That second step matters:
+    routing eval through SessionManager keeps out_count and Out[N] history
+    in sync, which earlier shipped-then-broken SoloRunCell+SafeEval path
+    silently lost (returning Null inNumber/outNumber)."""
+    from mathematica_kernel_mcp.backends import SoloBackend
+    from mathematica_kernel_mcp.models import EvalResult
+
+    wl_calls = []
+    eval_calls = []
+
+    class FakeManager:
+        def evaluate_native(self, code, session_name="main", timeout=30, store_output=True):
+            wl_calls.append(code)
+            return {
+                "status": "ok",
+                "value": {"status": "ok", "cellID": 3,
+                          "style": "Code", "content": "21*2"},
+            }
+
+        def evaluate(self, code, timeout=30, summary_max=500):
+            eval_calls.append((code, timeout))
+            return EvalResult(
+                output_summary="42", head="Integer",
+                byte_size=16, leaf_count=1,
+                in_number=7, out_number=7, status="ok",
+            )
+
+    result = SoloBackend(FakeManager()).run_cell("/tmp/x.wl", 3, eval_timeout=5.0)
+
+    assert "SoloGetCellContent" in wl_calls[0]
+    assert "/tmp/x.wl" in wl_calls[0]
+    assert eval_calls == [("21*2", 5)]
+    assert result["status"] == "ok"
+    assert result["resultInputForm"] == "42"
+    assert result["in_number"] == 7
+    assert result["out_number"] == 7
+
+
+def test_solo_backend_run_cell_skips_non_executable_styles():
+    """Section/Text/Title cells must short-circuit with status=skipped instead
+    of being shipped to SafeEval as raw code."""
+    from mathematica_kernel_mcp.backends import SoloBackend
+
+    class FakeManager:
+        def evaluate_native(self, code, session_name="main", timeout=30, store_output=True):
+            return {
+                "status": "ok",
+                "value": {"status": "ok", "cellID": 2,
+                          "style": "Section", "content": "Setup"},
+            }
+
+        def evaluate(self, code, timeout=30, summary_max=500):
+            raise AssertionError("non-executable cells must not be evaluated")
+
+    result = SoloBackend(FakeManager()).run_cell("/tmp/x.wl", 2)
+    assert result["status"] == "skipped"
+    assert result["reason"] == "not_executable"
+    assert result["cellType"] == "Section"

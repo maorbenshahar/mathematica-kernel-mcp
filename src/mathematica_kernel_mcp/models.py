@@ -4,18 +4,6 @@ from dataclasses import dataclass, field
 
 
 @dataclass
-class Cell:
-    """A single cell parsed from a .m or .wl package file."""
-
-    number: int  # 1-indexed position in file
-    cell_id: str  # opaque cell reference; source refs are not persisted to .m/.wl
-    cell_type: str  # "Title", "Section", "Text", "Input", "Code", etc.
-    content: str  # the actual code or text
-    line_start: int  # line number in source file
-    line_end: int  # line number in source file
-
-
-@dataclass
 class EvalResult:
     """Result summary from a kernel evaluation."""
 

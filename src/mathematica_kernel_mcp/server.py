@@ -293,9 +293,13 @@ def _kernel_eval_json(
     env = manager.evaluate_native(code, session_name=kid, timeout=timeout)
     status = env.get("status", "ok")
     if status != "ok":
-        out = {"status": status}
-        if "inputForm" in env:
-            out["inputForm"] = env["inputForm"]
+        # Forward what SafeEval gave us so the caller can see WHY it failed
+        # (parse error text, abort messages, etc.) — earlier code dropped
+        # everything except status, leaving the agent with no diagnostics.
+        out: dict = {"status": status}
+        for key in ("messages", "head", "inputForm"):
+            if env.get(key) not in (None, "", [], ()):
+                out[key] = env[key]
         return out
     value = env.get("value")
     try:
@@ -334,8 +338,9 @@ mcp = FastMCP(
   `<< SharedKernelMCP`` + `StartSharedKernelBridge[]`. The bridge uses an
   authenticated localhost socket. You drive a kernel they share with you, edits
   land live in their open notebook, and they see your activity in real time.
-- **Solo**: no bridge. Files are mutated on disk; code runs in a kernel the
-  MCP spawns via `wolframclient`. Requires a locatable WolframKernel binary.
+- **Solo**: no bridge. The MCP-managed kernel opens the file through a
+  headless Mathematica front end, mutates it on disk, and evaluates code via
+  `wolframclient`. Requires a locatable WolframKernel and front end.
 
 You don't pick a mode — every `notebook_*` tool dispatches based on whether a
 bridge is present for the file you pass in. Use `bridge_list()` to inspect
@@ -409,11 +414,12 @@ systems, etc.). `notebook_abort_evaluation` exists as a fallback but its
 behavior depends on mode + OS (see that tool's docstring) — in collab mode
 it surfaces a dialog the user must dismiss.
 
-`cell_id` is opaque — pass back what you got from `notebook_read` / `notebook_search`.
-In collab it's a Mathematica `CellID` (integer, stable across reorders).
-In solo `.m`/`.wl` it is an opaque source ref that is invalidated when the file
-changes; re-read after mutations or `stale_cell_reference` responses. `.nb`
-files require collab mode — solo mode refuses them.
+`cell_id` is opaque -- pass back what you got from `notebook_read` / `notebook_search`.
+It is a Mathematica `CellID` integer in both collab and solo. In solo package
+files CellIDs live only in the cached headless notebook, so if the file changes
+on disk outside the MCP, mutating/running by an old CellID returns
+`stale_file_changed`; re-read and retry. Solo mode supports `.m`, `.wl`, and
+`.nb` when a headless front end is available.
 """,
     lifespan=lifespan,
 )
@@ -471,14 +477,12 @@ def notebook_read(
     """Read the cell layout of `path`.
 
     In collab mode this reflects the live front-end notebook (with stable
-    CellIDs injected on first read). In solo mode this parses the file on
-    disk; `.m`/`.wl` cells return opaque source refs that go stale when the
-    file changes.
+    CellIDs injected on first read). In solo mode this opens the file through
+    a headless front end and returns integer CellIDs from that hidden notebook.
 
-    Each cell carries `index`, `cellID`, `style`, `label` (the front-end's
-    `In[N]:= ` / `Out[N]= ` text in collab mode — your shared vocabulary with
-    the user — or `""` in solo), `contentChars` (full length even when only
-    `preview` is returned), and either `content` or `preview`.
+    Each cell carries `index`, `cellID`, `style`, `label` (front-end label text
+    when present), `contentChars` (full length even when only `preview` is
+    returned), and either `content` or `preview`.
 
     Defaults to `include_content=False` — outline-first to keep responses
     cheap. Pass `include_content=True` only when you actually need the full
@@ -508,8 +512,14 @@ def notebook_read(
             all_cells = [c for c in all_cells if str(c.get("cellID")) in wanted]
 
         if start is not None or end is not None:
+            # `start`/`end` slice over the file's original cell positions, not
+            # over the post-filter list — so when `cells=`/`styles=` already
+            # shrunk all_cells, the upper bound must still cover any original
+            # index. Using `len(all_cells)` here was wrong: e.g. with prior
+            # styles filter leaving indices [1,3,5,9] and start=2, end=None,
+            # `hi = len + start = 6` would drop the cell at index 9.
             lo = start if start is not None else 1
-            hi = end if end is not None else len(all_cells) + (start or 0)
+            hi = end if end is not None else float("inf")
             all_cells = [c for c in all_cells if lo <= c.get("index", 0) <= hi]
 
         if styles is not None:
@@ -932,13 +942,18 @@ def _normalize_terminal_text(text: str) -> str:
 
 
 def _wl_string(value: str) -> str:
-    return json.dumps(value)
+    # ensure_ascii=False: this string is inline-substituted into WL source,
+    # and WL's string-literal lexer doesn't recognize \uXXXX escapes (it uses
+    # \:NNNN). With the default ensure_ascii=True, a query containing e.g.
+    # "Α" would become the literal 6 chars "Α" inside the WL string,
+    # silently turning a non-ASCII search into a no-op.
+    return json.dumps(value, ensure_ascii=False)
 
 
 def _wl_string_list(values: list[str]) -> str:
     if not values:
         return "{}"
-    return "{" + ", ".join(json.dumps(v) for v in values) + "}"
+    return "{" + ", ".join(_wl_string(v) for v in values) + "}"
 
 
 def _symbol_list_expr(expr: str) -> str:

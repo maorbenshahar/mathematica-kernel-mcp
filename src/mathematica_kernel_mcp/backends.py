@@ -7,43 +7,43 @@ based on whether a shared-kernel bridge is present:
   `StartSharedKernelBridge[...]` evaluated. We talk to the user's kernel via the
   authenticated socket bridge; edits land live in their open notebook; kernel
   state is shared. Works for both `.m`/`.wl` and `.nb` files.
-- `SoloBackend` (solo): no bridge. We mutate the `.m`/`.wl` file on disk and run
-  code in a kernel the MCP spawns via wolframclient. The user is not involved.
-  `.nb` files require collab mode; the dispatcher refuses them in solo.
-
-A `get_backend_for(path)` dispatcher picks the right backend based on whether
-a matching bridge exists in the global bridge registry.
+- `SoloBackend` (solo): no bridge. The MCP-managed kernel attaches a temporary
+  headless front-end (via `UsingFrontEnd`) and opens the file with
+  `NotebookOpen[..., Visible -> False]`. Cell layout and mutations go through
+  Mathematica's own notebook machinery — same source of truth as the bridge
+  path. The kernel caches the headless notebook per path so CellIDs stay
+  stable across calls (Mathematica's package format doesn't persist CellIDs
+  to `.m`/`.wl` on disk).
 """
 
 from __future__ import annotations
 
+import json
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
-from pathlib import Path
 
-from wolframclient.language import wlexpr
-
-from .bridge import BridgeError, SharedKernelBridge, bridge_record_for_file
-from .parser import (
-    CellMarkerCollisionError,
-    CommentNestingError,
-    StaleCellReferenceError,
-    create_m_cell,
-    delete_m_cell,
-    parse_file,
-    resolve_m_cell,
-    update_m_cell,
-)
+from .bridge import SharedKernelBridge, bridge_record_for_file
 
 
-_WRITE_REFUSAL_ERRORS = (CellMarkerCollisionError, CommentNestingError)
+_EXECUTABLE_CELL_TYPES = {"Input", "Code"}
 
 
-_NOTEBOOK_EXTENSION = ".nb"
+def _wl_string(value: str) -> str:
+    """Render a Python string as a WL string literal for inline substitution.
+
+    `ensure_ascii=False` keeps non-ASCII codepoints as themselves (WL's lexer
+    doesn't understand `\\uXXXX` — it uses `\\:NNNN`).
+    """
+    return json.dumps(value, ensure_ascii=False)
 
 
-def _is_notebook_path(path: str) -> bool:
-    return Path(path).suffix.lower() == _NOTEBOOK_EXTENSION
+class SoloBackendError(RuntimeError):
+    """Solo backend WL call returned a non-ok SafeEval envelope.
+
+    Distinct from `BridgeError` so `_backend_call` in server.py can label
+    these as `backend_error` (the generic fallback) instead of misleadingly
+    naming a bridge that solo mode doesn't use.
+    """
 
 
 class Backend(ABC):
@@ -122,8 +122,7 @@ def _integer_cell_id(value, *, label: str = "cell_id") -> int:
         return int(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(
-            f"{label} must be an integer CellID in collab mode, or a "
-            "source ref returned by notebook_read for solo .m/.wl files"
+            f"{label} must be an integer CellID returned by notebook_read"
         ) from exc
 
 
@@ -217,96 +216,66 @@ class BridgeBackend(Backend):
 
 
 # ---------------------------------------------------------------------------
-# Solo backend
+# Solo backend — uses Mathematica's own notebook machinery via headless FE
 # ---------------------------------------------------------------------------
-
-
-def _cell_to_payload(cell, *, source_refs: bool = False) -> dict:
-    """Render a parser `Cell` as the same dict shape BridgeBackend returns."""
-    payload = {
-        "index": cell.number,
-        "cellID": cell.cell_id if source_refs else cell.number,
-        "style": cell.cell_type,
-        # `label` mirrors the bridge's CurrentValue[cellObj, CellLabel]. Solo
-        # mode doesn't have a front end so there's no rendered In[N]:= label
-        # to surface; the field is present (empty) for shape parity with the
-        # bridge response.
-        "label": "",
-        "contentChars": len(cell.content),
-        "content": cell.content,
-    }
-    if source_refs:
-        payload.update(
-            {
-                "sourceRef": cell.cell_id,
-                "lineStart": cell.line_start,
-                "lineEnd": cell.line_end,
-            }
-        )
-    return payload
-
-
-def _cell_selector(cell_id):
-    if isinstance(cell_id, str) and cell_id.startswith("src:v1:"):
-        return {"cell_id": cell_id}
-    return {"cell_number": _integer_cell_id(cell_id)}
-
-
-def _stale_reference_payload(exc: StaleCellReferenceError) -> dict:
-    return exc.to_payload()
 
 
 class SoloBackend(Backend):
     mode = "solo"
 
     def __init__(self, manager):
-        # manager: SessionManager (lazy-started by the caller)
+        # `manager` is the SessionManager. We call the Solo* WL primitives
+        # in `init.m`, which open the file in a headless front-end attached
+        # via UsingFrontEnd and forward to the same Bridge* primitives the
+        # collab path uses. So the cell view matches what Mathematica's UI
+        # would show, not whatever a regex over (* ::Style:: *) markers
+        # happens to produce.
         self.manager = manager
 
-    def read(
-        self,
-        path,
-        *,
-        include_content: bool = True,
-        preview_chars: int = 80,
-    ):
-        cells = parse_file(path)
-        payload_cells = [_cell_to_payload(c, source_refs=True) for c in cells]
-        if not include_content:
-            for c in payload_cells:
-                flat = c.get("content", "").replace("\n", " ")
-                c["preview"] = (
-                    flat
-                    if len(flat) <= preview_chars
-                    else flat[: max(0, preview_chars - 3)] + "..."
-                )
-                c.pop("content", None)
-        return {
-            "status": "ok",
-            "path": path,
-            "cells": payload_cells,
-        }
+    def _eval_for_json(self, wl_code: str):
+        """Run WL code via SafeEval and return the native Python value."""
+        env = self.manager.evaluate_native(wl_code, store_output=False)
+        if env.get("status") != "ok":
+            raise SoloBackendError(
+                f"Solo backend WL call failed: status={env.get('status')!r}; "
+                f"messages={env.get('messages', [])}"
+            )
+        return env.get("value")
+
+    def read(self, path, *, include_content=True, preview_chars=80):
+        include = "True" if include_content else "False"
+        wl = (
+            f"SharedKernelMCP`SoloReadNotebook[{_wl_string(path)}, "
+            f"{include}, {int(preview_chars)}]"
+        )
+        return self._eval_for_json(wl)
 
     def run_cell(self, path, cell_id, eval_timeout: float | None = None):
-        try:
-            cell = resolve_m_cell(path, **_cell_selector(cell_id))
-        except StaleCellReferenceError as exc:
-            return _stale_reference_payload(exc)
-
-        if cell.cell_type not in {"Input", "Code"}:
+        # Step 1: pull the cell's content out of the headless notebook (WL).
+        # Step 2: evaluate it through the standard SessionManager path so
+        # out_count / Out[N] history is tracked the same way as for any
+        # other eval in this kernel — agents that follow up with
+        # `notebook_get_output(path, out_number)` need that history.
+        cid = _integer_cell_id(cell_id)
+        info = self._eval_for_json(
+            f"SharedKernelMCP`SoloGetCellContent[{_wl_string(path)}, {cid}]"
+        )
+        if not isinstance(info, dict) or info.get("status") != "ok":
+            return info
+        style = info.get("style")
+        if style not in _EXECUTABLE_CELL_TYPES:
             return {
                 "status": "skipped",
-                "cellID": cell.cell_id,
-                "index": cell.number,
+                "cellID": cid,
                 "reason": "not_executable",
-                "cellType": cell.cell_type,
+                "cellType": style,
             }
         kwargs = {"timeout": int(eval_timeout)} if eval_timeout else {}
-        result = self.manager.evaluate(cell.content, **kwargs)
+        result = self.manager.evaluate(info.get("content", ""), **kwargs)
         return {
             "status": result.status,
-            "cellID": cell.cell_id,
-            "index": cell.number,
+            "cellID": cid,
+            "style": style,
             "resultInputForm": result.output_summary,
             "messages": result.messages,
             "in_number": result.in_number,
@@ -318,73 +287,38 @@ class SoloBackend(Backend):
         }
 
     def update_cell(self, path, cell_id, cell_type, content):
-        try:
-            new_cell = update_m_cell(
-                path,
-                **_cell_selector(cell_id),
-                content=content,
-                cell_type=cell_type,
-            )
-        except StaleCellReferenceError as exc:
-            return _stale_reference_payload(exc)
-        except _WRITE_REFUSAL_ERRORS as exc:
-            return exc.to_payload()
-        return {
-            "status": "ok",
-            "cellID": new_cell.cell_id,
-            "cellType": new_cell.cell_type,
-        }
+        wl = (
+            f"SharedKernelMCP`SoloUpdateCell[{_wl_string(path)}, "
+            f"{_integer_cell_id(cell_id)}, {_wl_string(cell_type)}, "
+            f"{_wl_string(content)}]"
+        )
+        return self._eval_for_json(wl)
 
     def insert_cell_after(self, path, anchor_cell_id, cell_type, content):
-        selector = _cell_selector(anchor_cell_id)
-        try:
-            new_cell = create_m_cell(
-                path,
-                cell_type,
-                content,
-                after_cell=selector.get("cell_number"),
-                after_cell_id=selector.get("cell_id"),
-            )
-        except StaleCellReferenceError as exc:
-            return _stale_reference_payload(exc)
-        except _WRITE_REFUSAL_ERRORS as exc:
-            return exc.to_payload()
-        return {
-            "status": "ok",
-            "newCellID": new_cell.cell_id,
-            "anchorCellID": anchor_cell_id,
-            "position": "After",
-        }
+        wl = (
+            f"SharedKernelMCP`SoloInsertCellAfter[{_wl_string(path)}, "
+            f"{_integer_cell_id(anchor_cell_id, label='anchor_cell_id')}, "
+            f"{_wl_string(cell_type)}, {_wl_string(content)}]"
+        )
+        return self._eval_for_json(wl)
 
     def insert_cell_before(self, path, anchor_cell_id, cell_type, content):
-        selector = _cell_selector(anchor_cell_id)
-        try:
-            new_cell = create_m_cell(
-                path,
-                cell_type,
-                content,
-                before_cell=selector.get("cell_number"),
-                before_cell_id=selector.get("cell_id"),
-            )
-        except StaleCellReferenceError as exc:
-            return _stale_reference_payload(exc)
-        except _WRITE_REFUSAL_ERRORS as exc:
-            return exc.to_payload()
-        return {
-            "status": "ok",
-            "newCellID": new_cell.cell_id,
-            "anchorCellID": anchor_cell_id,
-            "position": "Before",
-        }
+        wl = (
+            f"SharedKernelMCP`SoloInsertCellBefore[{_wl_string(path)}, "
+            f"{_integer_cell_id(anchor_cell_id, label='anchor_cell_id')}, "
+            f"{_wl_string(cell_type)}, {_wl_string(content)}]"
+        )
+        return self._eval_for_json(wl)
 
     def delete_cell(self, path, cell_id):
-        try:
-            removed = delete_m_cell(path, **_cell_selector(cell_id))
-        except StaleCellReferenceError as exc:
-            return _stale_reference_payload(exc)
-        return {"status": "ok", "deletedCellID": removed.cell_id}
+        wl = (
+            f"SharedKernelMCP`SoloDeleteCell[{_wl_string(path)}, "
+            f"{_integer_cell_id(cell_id)}]"
+        )
+        return self._eval_for_json(wl)
 
     def evaluate(self, _path, code, eval_timeout: float | None = None):
+        # Free-form eval: no notebook involvement, just run code in the kernel.
         kwargs = {"timeout": int(eval_timeout)} if eval_timeout else {}
         result = self.manager.evaluate(code, **kwargs)
         return {
@@ -403,32 +337,38 @@ class SoloBackend(Backend):
         self, path, anchor_cell_id, code, cell_type="Code",
         eval_timeout: float | None = None,
     ):
-        # Insert + run + return. The Input cell is persisted in the .m/.wl file.
+        # Two-step: insert the cell via WL (so the file gets it), then
+        # evaluate the code through the standard manager path so out_count
+        # advances. Mirrors run_cell — Python owns evaluation, WL owns
+        # notebook structure.
         ins = self.insert_cell_after(path, anchor_cell_id, cell_type, code)
-        new_id = ins.get("newCellID")
-        if new_id is None:
+        if not isinstance(ins, dict) or ins.get("status") != "ok":
             return {"error": "insert_failed", "insert_result": ins}
-        run = self.run_cell(path, new_id, eval_timeout=eval_timeout)
+        new_id = ins.get("newCellID")
+        kwargs = {"timeout": int(eval_timeout)} if eval_timeout else {}
+        result = self.manager.evaluate(code, **kwargs)
         return {
-            "status": run.get("status"),
+            "status": result.status,
             "newCellID": new_id,
-            "anchorCellID": anchor_cell_id,
-            "resultInputForm": run.get("resultInputForm"),
-            "messages": run.get("messages", []),
+            "anchorCellID": _integer_cell_id(anchor_cell_id, label="anchor_cell_id"),
+            "resultInputForm": result.output_summary,
+            "messages": result.messages,
+            "in_number": result.in_number,
+            "out_number": result.out_number,
+            "head": result.head,
+            "is_truncated": result.is_truncated,
         }
 
     def sweep_outputs(self, _path):
-        # No-op in solo mode: .m/.wl files don't persist Output cells.
+        # Solo run_cell evaluates through the kernel without writing Output
+        # cells back to the headless notebook, so there are no
+        # bridge-tagged outputs to sweep. No-op.
         return {"status": "ok", "swept_count": 0, "note": "solo mode no-op"}
 
     def evaluate_for_json(self, code):
-        # Internal-only path: caller built `code` and wants its native Python
-        # value. wolframclient converts WL→Python directly (strings → str,
-        # Integer → int, List → list, Association → dict, Real → Decimal),
-        # so no ExportString / JSON round-trip is needed.
-        from .session import _to_python
-        managed = self.manager.get_session("main")
-        return _to_python(managed.session.evaluate(wlexpr(code)))
+        # Generic kernel-side JSON-returning evaluation. Goes through SafeEval
+        # for timeout/error safety.
+        return self._eval_for_json(code)
 
     def abort_evaluation(self, signal: str = "SIGINT") -> dict:
         pid = self.manager.abort_session("main", signal=signal)
@@ -455,16 +395,11 @@ def get_backend_for(path: str, manager_factory, timeout: float = 30.0) -> Backen
     only invoked when solo mode is selected, so collab-mode usage doesn't pay
     the cost of spawning a kernel.
 
-    Raises `BridgeError` for a `.nb` file with no live bridge: solo mode
-    cannot mutate `.nb` files; open the notebook in Mathematica and run
-    `StartSharedKernelBridge[]`.
+    Solo mode now handles `.nb`, `.m`, and `.wl` uniformly via a headless
+    front-end (UsingFrontEnd + NotebookOpen[..., Visible -> False]). It needs
+    a Mathematica installation with a usable front-end binary; otherwise the
+    underlying WL call returns status='front_end_unavailable' with guidance.
     """
     if has_bridge_for(path):
         return BridgeBackend(path, timeout=timeout)
-    if _is_notebook_path(path):
-        raise BridgeError(
-            f".nb files require collab mode. No live shared kernel bridge is "
-            f"registered for {path!s}. Open the notebook in Mathematica and "
-            "run `StartSharedKernelBridge[]`."
-        )
     return SoloBackend(manager_factory())

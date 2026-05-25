@@ -99,6 +99,44 @@ def test_documentation_tokens_preserves_user_case():
     assert _documentation_tokens("   ") == []
 
 
+def test_wl_string_preserves_non_ascii():
+    """Regression: server-side `_wl_string` is inline-substituted into WL
+    source. WL's string-literal lexer recognizes `\\:NNNN` for unicode, NOT
+    `\\uNNNN`. The default `json.dumps(ensure_ascii=True)` produced `\\uNNNN`
+    escapes that the kernel parsed as the literal 6 chars `\\uXXXX`, so a
+    documentation query containing Greek letters silently matched nothing."""
+    from mathematica_kernel_mcp.server import _wl_string, _wl_string_list
+
+    assert _wl_string("Plot") == '"Plot"'
+    # Non-ASCII must pass through as the real codepoint, not as \\uXXXX.
+    assert _wl_string("Α") == '"Α"'  # Greek capital alpha, U+0391
+    assert "\\u" not in _wl_string("Α")
+    assert _wl_string_list(["Α", "β"]) == '{"Α", "β"}'
+
+
+def test_kernel_eval_json_forwards_messages_on_failure():
+    """Regression: when SafeEval returns parse_error / timeout / aborted,
+    _kernel_eval_json used to drop everything but `status`, leaving the
+    agent with no diagnostic context. Now `messages`, `head`, and
+    `inputForm` flow through when present."""
+    from mathematica_kernel_mcp.server import _kernel_eval_json
+
+    class FakeManager:
+        def evaluate_native(self, code, session_name="main", timeout=30):
+            return {
+                "status": "parse_error",
+                "head": "$Failed",
+                "inputForm": "$Failed",
+                "messages": ["ToExpression::sntxi: Incomplete expression"],
+            }
+
+    out = _kernel_eval_json(FakeManager(), "main", "Sqrt[")
+    assert out["status"] == "parse_error"
+    assert out["head"] == "$Failed"
+    assert out["inputForm"] == "$Failed"
+    assert "Incomplete expression" in out["messages"][0]
+
+
 def test_truncate_result_input_form_preserves_small_resultjson():
     payload = {"resultJSON": [1, 2, 3]}
     result = _truncate_result_input_form(payload, json_max_chars=1000)

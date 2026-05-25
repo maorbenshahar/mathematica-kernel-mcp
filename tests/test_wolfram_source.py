@@ -158,3 +158,40 @@ def test_kernel_get_output_reads_private_safeeval_history():
     body = source[start:end]
 
     assert 'ref = f"wolfram$mcp$out[{int(out_number)}]"' in body
+
+
+def test_solo_headless_cache_detects_external_file_changes():
+    source = INIT_M.read_text()
+    start = source.index("soloFileFingerprint[")
+    solo = source[start:source.index("\nSoloReadNotebook[path_String", start)]
+
+    assert "soloFileFingerprint" in solo
+    assert "FileHash[key, \"SHA256\"]" in solo
+    assert "stale_file_changed" in solo
+    assert "reloadIfChanged" in solo
+    assert "soloRefreshFingerprint[path, nb]" in solo
+    assert "SoloReadNotebook[path_String" in source
+    assert "False, True" in source
+
+
+def test_package_file_mutations_validate_marker_and_comment_corruption():
+    source = INIT_M.read_text()
+    validation = source[
+        source.index("packageCellContentValidation["):
+        source.index("\nBridgeUpdateCell[path_String")
+    ]
+    update = source[
+        source.index("\nBridgeUpdateCell[path_String"):
+        source.index("\nbridgeInsertCellAt[")
+    ]
+    insert = source[
+        source.index("\nbridgeInsertCellAt["):
+        source.index("\nBridgeInsertCellAfter[")
+    ]
+
+    assert "cell_marker_collision" in validation
+    assert "comment_nesting_error" in validation
+    assert "Return[<|" in validation
+    assert "|>, Module]" in validation
+    assert "packageCellContentValidation[path, cellID, cellType, content]" in update
+    assert "packageCellContentValidation[path, newId, cellType, content]" in insert

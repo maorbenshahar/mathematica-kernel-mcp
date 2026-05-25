@@ -1,6 +1,6 @@
 PacletObject[<|
   "Name" -> "SharedKernelMCP",
-  "Version" -> "0.4.0",
+  "Version" -> "0.5.0",
   "WolframVersion" -> "12.0+",
   "Description" -> "Shared kernel bridge for collaborative Mathematica + LLM workflows. \
 Pairs with mathematica-kernel-mcp (the Python MCP server).",

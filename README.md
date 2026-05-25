@@ -91,10 +91,12 @@ route evaluation/output lookup through an explicit agent-owned kernel while
 still reading notebook cell contents from the target file.
 
 `cell_id` is opaque — pass back what you got from `notebook_read` /
-`notebook_search`. In collab it is a native Mathematica `CellID` where the
-front end provides one. In solo `.m`/`.wl` mode it is a source ref derived
-from the current file content; if the file changes before a mutation, the MCP
-returns `stale_cell_reference` and you should re-read.
+`notebook_search`. It is always a native Mathematica `CellID` integer (collab
+mode uses the live front end; solo mode attaches a headless front end via
+`UsingFrontEnd` and keeps a cached hidden notebook per file so CellIDs stay
+stable across calls). If a `.m`/`.wl` file is modified on disk outside the
+MCP, mutating by an old CellID returns `stale_file_changed`; re-read and
+retry.
 
 `StartSharedKernelBridge[]` starts a localhost socket bridge. Socket responses
 are UTF-8 JSON with `Content-Length` framing, so large notebook reads do not
@@ -154,8 +156,10 @@ depends on mode + OS:
 
 ## Known Limitations
 
-- `.nb` files require collab mode (open the notebook in Mathematica and run
-  `StartSharedKernelBridge[]`). Solo mode handles `.m`/`.wl` only.
+- Solo mode needs a Mathematica installation with a usable front end (it
+  attaches a hidden one via `UsingFrontEnd`). Headless server installs without
+  a front end can still use collab mode by opening the file in Mathematica
+  and running `StartSharedKernelBridge[]`.
 - Graphics currently return textual summaries/InputForm. Rich graphics export is
   planned separately.
 

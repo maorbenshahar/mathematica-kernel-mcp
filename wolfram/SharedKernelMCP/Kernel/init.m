@@ -56,6 +56,45 @@ BridgeSweepStaleOutputs::usage =
   "BridgeSweepStaleOutputs[path] removes Output cells tagged BridgeOutputFor:<n> whose anchor \
 cellID `n` no longer exists in the notebook. Returns an association with status and sweptCount.";
 
+SoloReadNotebook::usage =
+  "SoloReadNotebook[path, includeContent, previewChars] opens `path` in a temporary headless \
+front-end (UsingFrontEnd + NotebookOpen[..., Visible -> False]), then forwards to \
+BridgeReadNotebook so .m/.wl files get exactly Mathematica's own cell view (not our own regex \
+guess). Used by the Python SoloBackend when no live shared kernel bridge is registered for the \
+file. Returns the same shape as BridgeReadNotebook, or status='front_end_unavailable' on installs \
+that lack a usable front-end.";
+
+SoloGetCellContent::usage =
+  "SoloGetCellContent[path, cellID] opens `path` via a headless front-end and returns an \
+association with the cell's style and InputForm-rendered content. The Python solo backend then \
+evaluates that content through SafeEval with the kernel's own out-number tracking, so Out[N] \
+history works for solo .m/.wl runs the same way it does in collab mode.";
+
+SoloUpdateCell::usage =
+  "SoloUpdateCell[path, cellID, cellType, content] rewrites the cell with the given CellID via a \
+headless front-end and saves the file.";
+
+SoloInsertCellAfter::usage =
+  "SoloInsertCellAfter[path, anchorCellID, cellType, content] inserts a new cell after \
+anchorCellID via a headless front-end and saves the file.";
+
+SoloInsertCellBefore::usage =
+  "SoloInsertCellBefore[path, anchorCellID, cellType, content] inserts a new cell before \
+anchorCellID via a headless front-end and saves the file.";
+
+SoloDeleteCell::usage =
+  "SoloDeleteCell[path, cellID] deletes the cell with the given CellID via a headless front-end \
+and saves the file.";
+
+
+SoloCloseNotebook::usage =
+  "SoloCloseNotebook[path] closes the cached headless notebook for `path`, if any.";
+
+SoloCloseAllNotebooks::usage =
+  "SoloCloseAllNotebooks[] closes every cached headless notebook in this kernel. The Python \
+session manager invokes this before kernel shutdown so the headless front-end doesn't outlive \
+the kernel.";
+
 SafeEval::usage =
   "SafeEval[code, opts] is the canonical eval entry point used by both the socket bridge and \
 the Python session manager. It pre-parses `code` with ToExpression+HoldComplete (rewrapping \
@@ -1235,8 +1274,82 @@ BridgeRunCell[path_String, cellID_Integer, evalTimeout_:Null] := Module[
   ]
 ];
 
+packageFilePathQ[path_String] := MemberQ[{"m", "wl"}, ToLowerCase[FileExtension[path]]];
+
+executableCellTypeQ[cellType_String] := MemberQ[{"Input", "Code"}, cellType];
+
+packageCellMarkerLineQ[line_String] := Module[{trim = StringTrim[line], inner},
+  If[! StringStartsQ[trim, "(*"] || ! StringEndsQ[trim, "*)"],
+    Return[False]
+  ];
+  inner = StringTrim[StringDrop[StringDrop[trim, 2], -2]];
+  StringStartsQ[inner, "::"] && StringCount[inner, "::"] >= 2
+];
+
+packageCommentNestingProblem[content_String] := Module[
+  {depth = 0, i = 1, n = StringLength[content], pair},
+  While[i < n,
+    pair = StringTake[content, {i, i + 1}];
+    Which[
+      pair === "(*",
+        depth++;
+        i += 2,
+      pair === "*)",
+        If[depth === 0,
+          Return["a `*)` at offset " <> ToString[i - 1] <> " closes the outer cell wrapper"]
+        ];
+        depth--;
+        i += 2,
+      True,
+        i++
+    ]
+  ];
+  If[depth > 0,
+    ToString[depth] <> " unclosed `(*` left at end of content",
+    None
+  ]
+];
+
+packageCellContentValidation[
+  path_String, cellID_Integer, cellType_String, content_String
+] := Module[{lines, problem},
+  If[! packageFilePathQ[path], Return[<|"status" -> "ok"|>]];
+
+  lines = StringSplit[content, {"\r\n", "\n", "\r"}, All];
+  Do[
+    If[packageCellMarkerLineQ[lines[[i]]],
+      Return[<|
+        "status" -> "cell_marker_collision",
+        "cellID" -> cellID,
+        "cellType" -> cellType,
+        "lineNumber" -> i,
+        "lineText" -> lines[[i]],
+        "message" -> "Cell content contains a line that Mathematica package files interpret as a cell marker; writing it would fragment the cell on the next open."
+      |>, Module]
+    ],
+    {i, Length[lines]}
+  ];
+
+  If[! executableCellTypeQ[cellType] && StringLength[StringTrim[content]] > 0,
+    problem = packageCommentNestingProblem[content];
+    If[problem =!= None,
+      Return[<|
+        "status" -> "comment_nesting_error",
+        "cellID" -> cellID,
+        "cellType" -> cellType,
+        "reason" -> problem,
+        "message" -> "Cell content has unbalanced Wolfram comment markers; writing it would corrupt the package-file cell wrapper."
+      |>]
+    ]
+  ];
+
+  <|"status" -> "ok"|>
+];
+
 BridgeUpdateCell[path_String, cellID_Integer, cellType_String, content_String] := Module[
-  {nb, target, replacement},
+  {nb, target, replacement, validation},
+  validation = packageCellContentValidation[path, cellID, cellType, content];
+  If[Lookup[validation, "status", "ok"] =!= "ok", Return[validation]];
   nb = findNotebookByPath[path];
   If[! MatchQ[nb, _NotebookObject],
     Return[<|"status" -> "notebook_not_open", "path" -> path|>]
@@ -1255,7 +1368,7 @@ BridgeUpdateCell[path_String, cellID_Integer, cellType_String, content_String] :
 bridgeInsertCellAt[
   path_String, cellID_Integer, cellType_String, content_String, position_Symbol
 ] := Module[
-  {nb, anchor, newId, newCell},
+  {nb, anchor, newId, newCell, validation},
   nb = findNotebookByPath[path];
   If[! MatchQ[nb, _NotebookObject],
     Return[<|"status" -> "notebook_not_open", "path" -> path|>]
@@ -1263,6 +1376,8 @@ bridgeInsertCellAt[
   anchor = cellIDTargetAfterNormalization[nb, cellID];
   If[! MatchQ[anchor, _CellObject], Return[anchor]];
   newId = nextFreeCellID[nb];
+  validation = packageCellContentValidation[path, newId, cellType, content];
+  If[Lookup[validation, "status", "ok"] =!= "ok", Return[validation]];
   newCell = Cell[content, cellType, CellID -> newId];
   withNotebookViewPreserved[nb,
     SelectionMove[anchor, position, Cell, AutoScroll -> False];
@@ -1345,6 +1460,183 @@ BridgeSweepStaleOutputs[path_String] := Module[
     "sweptCount" -> Length[swept],
     "swept" -> swept
   |>
+];
+
+(* ============================================================ *)
+(* Solo* primitives — same job as the Bridge* family, but run    *)
+(* against a headless front-end the kernel attaches on demand    *)
+(* via UsingFrontEnd. This lets the MCP's solo backend use       *)
+(* Mathematica's own cell-layout interpretation of .m/.wl files  *)
+(* instead of a Python-side regex parser that doesn't match what *)
+(* the front-end shows. NotebookOpen[..., Visible -> False] opens*)
+(* a hidden copy; mutating operations NotebookSave to disk.   *)
+(* ============================================================ *)
+
+SetAttributes[withHeadlessFrontEnd, HoldRest];
+
+If[! AssociationQ[$soloOpenNotebooks], $soloOpenNotebooks = <||>];
+
+soloCacheKey[path_String] := Module[{abs},
+  abs = Quiet @ Check[AbsoluteFileName[path], path];
+  If[StringQ[abs], abs, path]
+];
+
+soloFileFingerprint[path_String] := Module[{key = soloCacheKey[path]},
+  If[! FileExistsQ[key],
+    Return[<|"exists" -> False, "path" -> key|>]
+  ];
+  <|
+    "exists" -> True,
+    "path" -> key,
+    "byteCount" -> Quiet @ Check[FileByteCount[key], Missing["Unavailable"]],
+    "modified" -> Quiet @ Check[FileDate[key, "Modification"], Missing["Unavailable"]],
+    "hash" -> Quiet @ Check[FileHash[key, "SHA256"], Missing["Unavailable"]]
+  |>
+];
+
+soloRecordNotebook[record_] := Which[
+  MatchQ[record, _NotebookObject], record,
+  AssociationQ[record], Lookup[record, "Notebook", $Failed],
+  True, $Failed
+];
+
+soloRecordFingerprint[record_] := Which[
+  AssociationQ[record], Lookup[record, "Fingerprint", Missing["NoFingerprint"]],
+  True, Missing["NoFingerprint"]
+];
+
+(* CellIDs are not persisted to .m/.wl package files, so solo mode keeps a
+   hidden NotebookObject open per path. To avoid saving a stale hidden copy
+   over an external edit, every cached record carries the file fingerprint from
+   the last open/save. Mutating operations return stale_file_changed when the
+   on-disk file no longer matches; read operations are allowed to reopen. *)
+soloOpenOrReuse[path_String, reloadIfChanged_:False] := Module[
+  {key, currentFingerprint, cached, nb, cachedFingerprint},
+  key = soloCacheKey[path];
+  currentFingerprint = soloFileFingerprint[key];
+  cached = Lookup[$soloOpenNotebooks, key, Missing["NotCached"]];
+
+  If[cached =!= Missing["NotCached"],
+    nb = soloRecordNotebook[cached];
+    cachedFingerprint = soloRecordFingerprint[cached];
+    If[MatchQ[nb, _NotebookObject],
+      If[MatchQ[Quiet @ Check[NotebookFileName[nb], $Failed], _String],
+        If[cachedFingerprint === currentFingerprint,
+          Return[nb]
+        ];
+        If[TrueQ[reloadIfChanged],
+          Quiet @ Check[NotebookClose[nb], Null];
+          $soloOpenNotebooks = KeyDrop[$soloOpenNotebooks, key],
+          Return[<|
+            "status" -> "stale_file_changed",
+            "path" -> key,
+            "message" -> "The file changed on disk after solo mode opened its hidden notebook. Re-read the notebook and retry with the current CellID."
+          |>]
+        ],
+        $soloOpenNotebooks = KeyDrop[$soloOpenNotebooks, key]
+      ]
+    ]
+  ];
+
+  nb = Quiet @ Check[NotebookOpen[key, Visible -> False], $Failed];
+  If[! MatchQ[nb, _NotebookObject],
+    Return[$Failed]
+  ];
+  $soloOpenNotebooks[key] = <|
+    "Notebook" -> nb,
+    "Fingerprint" -> soloFileFingerprint[key]
+  |>;
+  nb
+];
+
+soloRefreshFingerprint[path_String, nb_NotebookObject] := Module[{key = soloCacheKey[path]},
+  $soloOpenNotebooks[key] = <|
+    "Notebook" -> nb,
+    "Fingerprint" -> soloFileFingerprint[key]
+  |>;
+  Null
+];
+
+withHeadlessFrontEnd[
+  path_String, body_, saveOnExit_:True, reloadIfChanged_:False
+] := UsingFrontEnd @ Module[{nb, result},
+  nb = soloOpenOrReuse[path, reloadIfChanged];
+  If[AssociationQ[nb] && KeyExistsQ[nb, "status"], Return[nb]];
+  If[! MatchQ[nb, _NotebookObject],
+    Return[<|
+      "status"  -> "front_end_unavailable",
+      "path"    -> path,
+      "message" -> "Could not attach a Mathematica front-end to open this " <>
+                   "file. Either install a Mathematica front-end (UsingFrontEnd " <>
+                   "needs it), or open the file in a Mathematica notebook and run " <>
+                   "StartSharedKernelBridge[] so the MCP can use the live bridge."
+    |>]
+  ];
+  result = body;
+  If[TrueQ[saveOnExit],
+    Quiet @ Check[NotebookSave[nb]; soloRefreshFingerprint[path, nb], Null]
+  ];
+  result
+];
+
+
+(* Public-ish: close one or all cached solo notebooks. The Python session
+   manager calls SoloCloseAllNotebooks[] before the kernel is stopped so the
+   headless FE doesn't outlive the kernel. *)
+SoloCloseNotebook[path_String] := Module[{key, record, nb},
+  key = soloCacheKey[path];
+  record = Lookup[$soloOpenNotebooks, key, Missing["NotCached"]];
+  nb = soloRecordNotebook[record];
+  If[MatchQ[nb, _NotebookObject],
+    UsingFrontEnd @ Quiet @ Check[NotebookClose[nb], Null]
+  ];
+  $soloOpenNotebooks = KeyDrop[$soloOpenNotebooks, key];
+  <|"status" -> "ok", "closed" -> key|>
+];
+
+SoloCloseAllNotebooks[] := Module[{paths},
+  paths = Keys[$soloOpenNotebooks];
+  Do[SoloCloseNotebook[p], {p, paths}];
+  <|"status" -> "ok", "closed_count" -> Length[paths]|>
+];
+
+(* Read: no mutation, no save needed. *)
+SoloReadNotebook[path_String, includeContent_:True, previewChars_:80] :=
+  withHeadlessFrontEnd[path, BridgeReadNotebook[path, includeContent, previewChars], False, True];
+
+(* Mutations: rely on BridgeXxx for the in-notebook work, then save. *)
+SoloUpdateCell[path_String, cellID_Integer, cellType_String, content_String] :=
+  withHeadlessFrontEnd[path, BridgeUpdateCell[path, cellID, cellType, content]];
+
+SoloInsertCellAfter[path_String, cellID_Integer, cellType_String, content_String] :=
+  withHeadlessFrontEnd[path, BridgeInsertCellAfter[path, cellID, cellType, content]];
+
+SoloInsertCellBefore[path_String, cellID_Integer, cellType_String, content_String] :=
+  withHeadlessFrontEnd[path, BridgeInsertCellBefore[path, cellID, cellType, content]];
+
+SoloDeleteCell[path_String, cellID_Integer] :=
+  withHeadlessFrontEnd[path, BridgeDeleteCell[path, cellID]];
+
+(* Read-only helper: pull a cell's style + InputForm content out of the
+   headless notebook. The Python side then evaluates the content via the
+   normal SessionManager.evaluate path so out_count / Out[N] history is
+   tracked the same way as for free-form notebook_eval. Splitting this
+   means we don't need to thread `StoreOutNumber` from Python through to
+   WL — evaluation stays where the counter lives. *)
+SoloGetCellContent[path_String, cellID_Integer] := withHeadlessFrontEnd[path,
+  Module[{nb, target, cellExpr, sty, txt},
+    nb = findNotebookByPath[path];
+    If[! MatchQ[nb, _NotebookObject],
+      Return[<|"status" -> "notebook_not_open", "path" -> path|>, Module]
+    ];
+    target = cellIDTargetAfterNormalization[nb, cellID];
+    If[! MatchQ[target, _CellObject], Return[target, Module]];
+    cellExpr = NotebookRead[target];
+    sty = Replace[cellStyleOf[cellExpr], Except[_String] -> "Cell"];
+    txt = cellInputCode[target];
+    <|"status" -> "ok", "cellID" -> cellID, "style" -> sty, "content" -> txt|>
+  ],
+  False
 ];
 
 SharedKernelBridgeRegistrySnapshot[] := Module[{file, record},
